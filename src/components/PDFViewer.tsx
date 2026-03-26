@@ -290,7 +290,11 @@ export default function PDFViewer() {
     if (!pdfFile) return;
     const loadPdf = async () => {
       const data = Uint8Array.from(atob(pdfFile.data), (c) => c.charCodeAt(0));
-      const doc = await pdfjsLib.getDocument({ data }).promise;
+      const doc = await pdfjsLib.getDocument({
+        data,
+        cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
+        cMapPacked: true,
+      }).promise;
       pdfDocRef.current = doc;
       setNumPages(doc.numPages);
       let fullText = '';
