@@ -1,6 +1,8 @@
-import { Trash2, MessageSquare, FileText, Highlighter, Underline, Strikethrough } from 'lucide-react';
+import { useState } from 'react';
+import { MessageSquare, FileText, Highlighter, Underline, Strikethrough, Pencil, Trash2 } from 'lucide-react';
 import { useStore } from '../stores/useStore';
-import type { HighlightColor, AnnotationType } from '../types';
+import type { Highlight, HighlightColor, AnnotationType } from '../types';
+import CommentModal from './CommentModal';
 
 const COLOR_MAP: Record<HighlightColor, string> = {
   yellow: 'border-l-yellow-400 bg-yellow-400/5',
@@ -18,6 +20,7 @@ const TYPE_ICONS: Record<AnnotationType, React.ReactNode> = {
 
 export default function AnnotationsPanel() {
   const { highlights, removeHighlight, updateHighlightComment, setCurrentPage } = useStore();
+  const [editingHighlight, setEditingHighlight] = useState<Highlight | null>(null);
 
   const sorted = [...highlights].sort((a, b) => {
     if (a.page !== b.page) return a.page - b.page;
@@ -32,7 +35,7 @@ export default function AnnotationsPanel() {
         </div>
         <p className="text-sm text-text-secondary font-medium mb-1">No annotations yet</p>
         <p className="text-xs text-text-muted leading-relaxed">
-          Use the highlight tool or select text and click "Highlight" to start annotating.
+          Choose a highlight, underline, strikethrough, or comment tool, then select text in the PDF.
         </p>
       </div>
     );
@@ -79,32 +82,50 @@ export default function AnnotationsPanel() {
                   </div>
                 )}
 
-                <div className="flex items-center gap-2 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className="mt-2 flex items-center gap-1.5 border-t border-surface-3/50 pt-1.5">
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      const comment = prompt('Add a comment:', h.comment || '');
-                      if (comment !== null) updateHighlightComment(h.id, comment);
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setEditingHighlight(h);
                     }}
-                    className="text-[10px] text-text-muted hover:text-accent-light transition-colors"
+                    className="flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-text-muted transition-colors hover:bg-surface-3 hover:text-accent-light"
+                    title={h.comment ? 'Edit comment' : 'Add comment'}
                   >
+                    <Pencil size={10} />
                     {h.comment ? 'Edit comment' : 'Add comment'}
                   </button>
                   <button
-                    onClick={(e) => {
-                      e.stopPropagation();
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
                       removeHighlight(h.id);
                     }}
-                    className="text-[10px] text-text-muted hover:text-red-400 transition-colors ml-auto"
+                    className="ml-auto flex items-center gap-1 rounded px-1.5 py-1 text-[10px] text-text-muted transition-colors hover:bg-red-500/10 hover:text-red-400"
+                    title="Remove annotation"
+                    aria-label="Remove annotation"
                   >
                     <Trash2 size={11} />
+                    Remove
                   </button>
                 </div>
+
               </div>
             ))}
           </div>
         </div>
       ))}
+      {editingHighlight && (
+        <CommentModal
+          text={editingHighlight.text}
+          initialComment={editingHighlight.comment || ''}
+          onSave={(comment) => {
+            updateHighlightComment(editingHighlight.id, comment.trim());
+            setEditingHighlight(null);
+          }}
+          onCancel={() => setEditingHighlight(null)}
+        />
+      )}
     </div>
   );
 }

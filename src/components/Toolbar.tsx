@@ -17,17 +17,19 @@ import {
   Strikethrough,
 } from 'lucide-react';
 import { savePdfWithAnnotations } from '../utils/pdf-save';
-import { useStore, ToolType } from '../stores/useStore';
+import { useStore, type ToolType } from '../stores/useStore';
 import type { HighlightColor } from '../types';
 import logoSvg from '../assets/logo.svg';
 
-const HIGHLIGHT_COLORS: { id: HighlightColor; bg: string; label: string }[] = [
-  { id: 'yellow', bg: 'bg-yellow-400', label: 'Yellow' },
-  { id: 'green', bg: 'bg-emerald-400', label: 'Green' },
-  { id: 'blue', bg: 'bg-blue-400', label: 'Blue' },
-  { id: 'pink', bg: 'bg-pink-400', label: 'Pink' },
-  { id: 'orange', bg: 'bg-orange-400', label: 'Orange' },
+const HIGHLIGHT_COLORS: Array<{ id: HighlightColor; label: string; bg: string }> = [
+  { id: 'yellow', label: 'Yellow', bg: 'bg-yellow-400' },
+  { id: 'green', label: 'Green', bg: 'bg-emerald-400' },
+  { id: 'blue', label: 'Blue', bg: 'bg-blue-400' },
+  { id: 'pink', label: 'Pink', bg: 'bg-pink-400' },
+  { id: 'orange', label: 'Orange', bg: 'bg-orange-400' },
 ];
+
+const COLOR_TOOLS: ToolType[] = ['highlight', 'underline', 'strikeout'];
 
 export default function Toolbar() {
   const {
@@ -50,9 +52,6 @@ export default function Toolbar() {
     toggleThumbnailSidebar,
     setSettingsOpen,
   } = useStore();
-
-  // Tools that support color selection
-  const colorTools: ToolType[] = ['highlight', 'underline', 'strikeout'];
 
   const handleSave = async () => {
     if (!pdfFile) return;
@@ -207,17 +206,18 @@ export default function Toolbar() {
             onClick={() => setActiveTool('comment')}
           />
 
-          {/* Color picker (visible when annotation tool active) */}
-          {colorTools.includes(activeTool) && (
-            <div className="titlebar-nodrag flex items-center gap-1 ml-1">
-              {HIGHLIGHT_COLORS.map((c) => (
+          {COLOR_TOOLS.includes(activeTool) && (
+            <div className="titlebar-nodrag ml-1 flex items-center gap-1">
+              {HIGHLIGHT_COLORS.map((color) => (
                 <button
-                  key={c.id}
-                  title={c.label}
-                  onClick={() => setActiveHighlightColor(c.id)}
-                  className={`w-5 h-5 rounded-full ${c.bg} transition-all ${
-                    activeHighlightColor === c.id
-                      ? 'ring-2 ring-white ring-offset-1 ring-offset-surface-1 scale-110'
+                  key={color.id}
+                  type="button"
+                  title={`${color.label} annotation`}
+                  aria-label={`${color.label} annotation color`}
+                  onClick={() => setActiveHighlightColor(color.id)}
+                  className={`h-4 w-4 rounded-full ${color.bg} transition-all ${
+                    activeHighlightColor === color.id
+                      ? 'scale-110 ring-2 ring-white ring-offset-1 ring-offset-surface-1'
                       : 'opacity-60 hover:opacity-100'
                   }`}
                 />
@@ -229,13 +229,6 @@ export default function Toolbar() {
 
       {/* Spacer */}
       <div className="flex-1" />
-
-      {/* Right side */}
-      {pdfFile && (
-        <span className="titlebar-nodrag text-xs text-text-muted truncate max-w-[200px] mr-2" title={pdfFile.name}>
-          {pdfFile.name}
-        </span>
-      )}
 
       <ToolbarButton
         icon={<Settings size={16} />}
@@ -262,7 +255,7 @@ function ToolbarButton({
 }: {
   icon: React.ReactNode;
   label: string;
-  onClick: () => void;
+  onClick?: () => void;
   active?: boolean;
   disabled?: boolean;
 }) {

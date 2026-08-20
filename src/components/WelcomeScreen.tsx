@@ -1,4 +1,4 @@
-import { Upload, Underline, Strikethrough } from 'lucide-react';
+import { Upload } from 'lucide-react';
 import { useStore } from '../stores/useStore';
 import logoSvg from '../assets/logo.svg';
 
@@ -18,7 +18,11 @@ export default function WelcomeScreen() {
         const reader = new FileReader();
         reader.onload = () => {
           const base64 = (reader.result as string).split(',')[1];
-          setPdfFile({ path: file.name, name: file.name, data: base64 });
+          setPdfFile({
+            path: (file as File & { path?: string }).path || file.name,
+            name: file.name,
+            data: base64,
+          });
         };
         reader.readAsDataURL(file);
       };
@@ -36,8 +40,8 @@ export default function WelcomeScreen() {
         Welcome to Lexio
       </h1>
       <p className="text-sm text-text-secondary max-w-md leading-relaxed mb-8">
-        Open a PDF to start reading. Highlight passages, add comments, and ask AI to explain
-        anything — with full document context.
+        Open a PDF to start reading, select passages, and build a reusable digest for fast,
+        page-aware AI questions.
       </p>
 
       <button
@@ -52,10 +56,9 @@ export default function WelcomeScreen() {
         or drag & drop a file anywhere · <kbd className="font-mono bg-surface-2 px-1.5 py-0.5 rounded text-[11px]">⌘O</kbd> to open
       </p>
 
-      <div className="mt-12 grid grid-cols-4 gap-4 max-w-xl">
-        <Feature icon="🖍️" title="Highlight" desc="Multi-color highlights" />
-        <Feature icon="📝" title="Underline" desc="Underline text" />
-        <Feature icon="✂️" title="Strikeout" desc="Cross out text" />
+      <div className="mt-12 grid grid-cols-3 gap-6 max-w-xl">
+        <Feature icon="📄" title="Read" desc="Page-aware PDF viewing" />
+        <Feature icon="🔎" title="Select" desc="Focus on passages" />
         <Feature icon="✨" title="Ask AI" desc="Explain passages" />
       </div>
     </div>

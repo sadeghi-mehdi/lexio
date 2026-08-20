@@ -8,18 +8,28 @@ const THUMBNAIL_SCALE = 0.2;
 export default function ThumbnailSidebar() {
   const containerRef = useRef<HTMLDivElement>(null);
   const thumbnailsRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
+  const thumbnailItemsRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const renderedPagesRef = useRef<Set<number>>(new Set());
+  const renderTasksRef = useRef<Map<number, any>>(new Map());
+  const loadGenerationRef = useRef(0);
 
   const { pdfFile, numPages, currentPage, setCurrentPage } = useStore();
 
   // Load PDF document
   useEffect(() => {
     if (!pdfFile) return;
+    const generation = ++loadGenerationRef.current;
+    let loadedDocument: pdfjsLib.PDFDocumentProxy | null = null;
 
     const loadPdf = async () => {
       const data = Uint8Array.from(atob(pdfFile.data), (c) => c.charCodeAt(0));
       const doc = await pdfjsLib.getDocument({ data }).promise;
+      loadedDocument = doc;
+      if (generation !== loadGenerationRef.current) {
+        await doc.destroy();
+        return;
+      }
       pdfDocRef.current = doc;
       renderedPagesRef.current.clear();
 
@@ -27,11 +37,20 @@ export default function ThumbnailSidebar() {
       renderVisibleThumbnails();
     };
 
-    loadPdf();
+    void loadPdf().catch((error) => {
+      if (generation === loadGenerationRef.current) {
+        console.error('Failed to load PDF thumbnails:', error);
+      }
+    });
 
     return () => {
-      pdfDocRef.current?.destroy();
-      pdfDocRef.current = null;
+      loadGenerationRef.current++;
+      for (const task of renderTasksRef.current.values()) {
+        try { task.cancel(); } catch {}
+      }
+      renderTasksRef.current.clear();
+      if (pdfDocRef.current === loadedDocument) pdfDocRef.current = null;
+      void loadedDocument?.destroy();
     };
   }, [pdfFile]);
 
@@ -53,12 +72,19 @@ export default function ThumbnailSidebar() {
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
 
-      await page.render({
+      const renderTask = page.render({
         canvasContext: ctx,
         viewport,
-      }).promise;
-    } catch {
+      });
+      renderTasksRef.current.set(pageNum, renderTask);
+      await renderTask.promise;
+    } catch (error: any) {
       renderedPagesRef.current.delete(pageNum);
+      if (error?.name !== 'RenderingCancelledException') {
+        console.error(`Failed to render thumbnail ${pageNum}:`, error);
+      }
+    } finally {
+      renderTasksRef.current.delete(pageNum);
     }
   }, []);
 
@@ -81,9 +107,8 @@ export default function ThumbnailSidebar() {
 
   // Scroll to current page thumbnail
   useEffect(() => {
-    const container = containerRef.current;
-    const thumbnail = document.getElementById(`thumbnail-${currentPage}`);
-    if (container && thumbnail) {
+    const thumbnail = thumbnailItemsRef.current.get(currentPage);
+    if (containerRef.current && thumbnail) {
       thumbnail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }, [currentPage]);
@@ -101,7 +126,10 @@ export default function ThumbnailSidebar() {
         {Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => (
           <div
             key={pageNum}
-            id={`thumbnail-${pageNum}`}
+            ref={(el) => {
+              if (el) thumbnailItemsRef.current.set(pageNum, el);
+              else thumbnailItemsRef.current.delete(pageNum);
+            }}
             onClick={() => handleThumbnailClick(pageNum)}
             className={`cursor-pointer rounded-lg overflow-hidden transition-all ${
               pageNum === currentPage
@@ -112,9 +140,8 @@ export default function ThumbnailSidebar() {
             <div className="bg-white relative">
               <canvas
                 ref={(el) => {
-                  if (el) {
-                    thumbnailsRef.current.set(pageNum, el);
-                  }
+                  if (el) thumbnailsRef.current.set(pageNum, el);
+                  else thumbnailsRef.current.delete(pageNum);
                 }}
                 className="w-full h-auto"
                 style={{ maxWidth: THUMBNAIL_WIDTH }}

@@ -1,4 +1,4 @@
-import type { ProviderConfig, ChatMessage } from '../types';
+import type { ProviderConfig, ChatMessage } from '../types.ts';
 
 // ─── Base Interface ───
 
@@ -127,11 +127,30 @@ const claudeProvider: AIProviderInterface = {
   },
 };
 
-// ─── OpenAI ───
+// ─── OpenAI-compatible APIs ───
 
-const openaiProvider: AIProviderInterface = {
-  async chat(messages, systemPrompt, config, signal, cb) {
-    const url = 'https://api.openai.com/v1/chat/completions';
+export function buildOpenAICompatibleUrl(baseUrl: string): string {
+  const normalized = baseUrl.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(normalized)) {
+    throw new Error('The API base URL must start with http:// or https://');
+  }
+  return normalized.endsWith('/chat/completions')
+    ? normalized
+    : `${normalized}/chat/completions`;
+}
+
+function createOpenAICompatibleProvider(
+  defaultBaseUrl: string,
+  label: string,
+  allowCustomBaseUrl: boolean
+): AIProviderInterface {
+  return {
+    async chat(messages, systemPrompt, config, signal, cb) {
+      const url = buildOpenAICompatibleUrl(
+        allowCustomBaseUrl ? config.baseUrl || defaultBaseUrl : defaultBaseUrl
+      );
+      if (!config.model.trim()) throw new Error('Enter a model name in Settings.');
+
     const body = {
       model: config.model,
       messages: [
@@ -141,52 +160,65 @@ const openaiProvider: AIProviderInterface = {
       stream: true,
     };
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal,
-    });
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${config.apiKey || ''}`,
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`OpenAI error ${res.status}: ${err}`);
-    }
-    if (!res.body) throw new Error('No response body');
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`${label} error ${res.status}: ${err}`);
+      }
+      if (!res.body) throw new Error('No response body');
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') {
-            cb.onDone();
-            return;
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') {
+              cb.onDone();
+              return;
+            }
+            try {
+              const json = JSON.parse(data);
+              const token = json.choices?.[0]?.delta?.content;
+              if (token) cb.onToken(token);
+            } catch {}
           }
-          try {
-            const json = JSON.parse(data);
-            const token = json.choices?.[0]?.delta?.content;
-            if (token) cb.onToken(token);
-          } catch {}
         }
       }
+      cb.onDone();
     }
-    cb.onDone();
-  },
-};
+  };
+}
+
+const openaiProvider = createOpenAICompatibleProvider(
+  'https://api.openai.com/v1',
+  'OpenAI',
+  false
+);
+
+const genericOpenAIProvider = createOpenAICompatibleProvider(
+  'https://openai.rc.asu.edu/v1',
+  'OpenAI-compatible API',
+  true
+);
 
 // ─── Gemini ───
 
@@ -249,25 +281,6 @@ export const providers: Record<string, AIProviderInterface> = {
   ollama: ollamaProvider,
   claude: claudeProvider,
   openai: openaiProvider,
+  openaiCompatible: genericOpenAIProvider,
   gemini: geminiProvider,
 };
-
-// ─── System Prompt Builder ───
-
-export function buildSystemPrompt(pdfText: string, maxChars: number = 100000): string {
-  const truncated = pdfText.length > maxChars ? pdfText.slice(0, maxChars) + '\n\n[... document truncated ...]' : pdfText;
-
-  return `You are Lexio, an intelligent PDF reading assistant. You help users understand documents by answering questions about their content.
-
-You have access to the full text of the currently open PDF document. When answering questions:
-- Reference specific parts of the document when relevant
-- Be precise and cite page numbers or sections when possible
-- If the user highlights a specific passage, focus your answer on that passage but use the broader document context
-- Explain complex concepts clearly, using analogies when helpful
-- If you're uncertain about something, say so rather than guessing
-- Format responses with markdown for readability (bold, lists, code blocks as appropriate)
-
-──── DOCUMENT CONTENT ────
-${truncated}
-──── END DOCUMENT ────`;
-}

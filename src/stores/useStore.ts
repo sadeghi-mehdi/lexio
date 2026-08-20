@@ -10,8 +10,11 @@ import type {
   HighlightColor,
   AnnotationType,
   RelativeRect,
-} from '../types';
-import { DEFAULT_PROVIDERS } from '../types';
+  DocumentDigest,
+  DigestStatus,
+} from '../types.ts';
+import { DEFAULT_SETTINGS } from '../types.ts';
+import { abortChatRequest } from '../utils/chat-request-registry.ts';
 
 export type ToolType = 'select' | AnnotationType | 'comment';
 
@@ -21,11 +24,50 @@ type UndoAction =
   | { type: 'remove_highlight'; highlight: Highlight }
   | { type: 'update_comment'; id: string; oldComment: string | undefined; newComment: string };
 
-interface AppState {
-  // PDF
-  pdfFile: PdfFileData | null;
+export interface DocumentTabSession {
+  id: string;
+  identity: string;
+  pdfFile: PdfFileData;
   pdfText: string;
   pageTexts: Map<number, string>;
+  extractedPageCount: number;
+  documentTextReady: boolean;
+  numPages: number;
+  currentPage: number;
+  zoom: number;
+  highlights: Highlight[];
+  annotations: Annotation[];
+  activeHighlightColor: HighlightColor;
+  activeTool: ToolType;
+  undoStack: UndoAction[];
+  redoStack: UndoAction[];
+  conversations: ChatConversation[];
+  activeConversation: string | null;
+  isStreaming: boolean;
+  selectedTextForAI: string;
+  selectedPageForAI: number;
+  selectedEndPageForAI: number;
+  selectedRectsForAI: RelativeRect[];
+  documentFingerprint: string;
+  documentDigest: DocumentDigest | null;
+  digestStatus: DigestStatus;
+  digestProgress: string;
+  digestError: string;
+  digestRebuildToken: number;
+  digestCancelToken: number;
+}
+
+interface AppState {
+  documentTabs: DocumentTabSession[];
+  activeDocumentTabId: string | null;
+
+  // PDF
+  pdfFile: PdfFileData | null;
+  documentSessionId: number;
+  pdfText: string;
+  pageTexts: Map<number, string>;
+  extractedPageCount: number;
+  documentTextReady: boolean;
   numPages: number;
   currentPage: number;
   zoom: number;
@@ -46,7 +88,15 @@ interface AppState {
   isStreaming: boolean;
   selectedTextForAI: string;
   selectedPageForAI: number;
+  selectedEndPageForAI: number;
   selectedRectsForAI: RelativeRect[];
+  documentFingerprint: string;
+  documentDigest: DocumentDigest | null;
+  digestStatus: DigestStatus;
+  digestProgress: string;
+  digestError: string;
+  digestRebuildToken: number;
+  digestCancelToken: number;
 
   // UI
   sidebarOpen: boolean;
@@ -60,8 +110,17 @@ interface AppState {
 
   // PDF Actions
   setPdfFile: (file: PdfFileData | null) => void;
+  switchDocumentTab: (id: string) => void;
+  closeDocumentTab: (id: string) => void;
+  updateCurrentPdfData: (data: string) => void;
   setPdfText: (text: string) => void;
   setPageText: (page: number, text: string) => void;
+  setExtractionProgress: (pageCount: number, complete?: boolean) => void;
+  setDocumentFingerprint: (fingerprint: string) => void;
+  setDocumentDigest: (digest: DocumentDigest | null) => void;
+  setDigestState: (status: DigestStatus, progress?: string, error?: string) => void;
+  rebuildDocumentDigest: () => void;
+  cancelDocumentDigest: () => void;
   setNumPages: (n: number) => void;
   setCurrentPage: (p: number) => void;
   setZoom: (z: number) => void;
@@ -85,13 +144,13 @@ interface AppState {
   canRedo: () => boolean;
 
   // AI Actions
-  setSelectedTextForAI: (text: string, page: number, rects?: RelativeRect[]) => void;
+  setSelectedTextForAI: (text: string, page: number, rects?: RelativeRect[], endPage?: number) => void;
   clearSelectedTextForAI: () => void;
   newConversation: () => string;
-  addMessage: (convId: string, msg: ChatMessage) => void;
-  updateLastAssistantMessage: (convId: string, content: string) => void;
+  addMessage: (convId: string, msg: ChatMessage, documentTabId?: string | null) => void;
+  updateLastAssistantMessage: (convId: string, content: string, documentTabId?: string | null) => void;
   setActiveConversation: (id: string | null) => void;
-  setIsStreaming: (v: boolean) => void;
+  setIsStreaming: (v: boolean, documentTabId?: string | null) => void;
   deleteConversation: (id: string) => void;
 
   // UI Actions
@@ -104,6 +163,7 @@ interface AppState {
   setThumbnailSidebarOpen: (v: boolean) => void;
 
   // Settings Actions
+  hydrateSettings: (settings: AppSettings) => void;
   updateSettings: (s: Partial<AppSettings>) => void;
   setActiveProvider: (p: AIProvider) => void;
   updateProviderConfig: (id: AIProvider, config: Partial<AppSettings['providers'][AIProvider]>) => void;
@@ -111,12 +171,129 @@ interface AppState {
 
 const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 
+function documentIdentity(file: PdfFileData): string {
+  return `${file.path.toLowerCase()}::${file.data.length}`;
+}
+
+function captureActiveSession(state: AppState): DocumentTabSession | null {
+  if (!state.pdfFile || !state.activeDocumentTabId) return null;
+  const indexWasRunning = ['extracting', 'loading', 'generating', 'consolidating'].includes(state.digestStatus);
+  return {
+    id: state.activeDocumentTabId,
+    identity: documentIdentity(state.pdfFile),
+    pdfFile: state.pdfFile,
+    pdfText: state.pdfText,
+    pageTexts: state.pageTexts,
+    extractedPageCount: state.extractedPageCount,
+    documentTextReady: state.documentTextReady,
+    numPages: state.numPages,
+    currentPage: state.currentPage,
+    zoom: state.zoom,
+    highlights: state.highlights,
+    annotations: state.annotations,
+    activeHighlightColor: state.activeHighlightColor,
+    activeTool: state.activeTool,
+    undoStack: state.undoStack,
+    redoStack: state.redoStack,
+    conversations: state.conversations,
+    activeConversation: state.activeConversation,
+    isStreaming: state.isStreaming,
+    selectedTextForAI: state.selectedTextForAI,
+    selectedPageForAI: state.selectedPageForAI,
+    selectedEndPageForAI: state.selectedEndPageForAI,
+    selectedRectsForAI: state.selectedRectsForAI,
+    documentFingerprint: state.documentFingerprint,
+    documentDigest: state.documentDigest,
+    digestStatus: indexWasRunning ? 'idle' : state.digestStatus,
+    digestProgress: indexWasRunning ? 'Paused — activate this tab to continue' : state.digestProgress,
+    digestError: state.digestError,
+    digestRebuildToken: state.digestRebuildToken,
+    digestCancelToken: state.digestCancelToken,
+  };
+}
+
+function newDocumentSession(file: PdfFileData): DocumentTabSession {
+  return {
+    id: uid(),
+    identity: documentIdentity(file),
+    pdfFile: file,
+    pdfText: '',
+    pageTexts: new Map(),
+    extractedPageCount: 0,
+    documentTextReady: false,
+    numPages: 0,
+    currentPage: 1,
+    zoom: 1,
+    highlights: [],
+    annotations: [],
+    activeHighlightColor: 'yellow',
+    activeTool: 'select',
+    undoStack: [],
+    redoStack: [],
+    conversations: [],
+    activeConversation: null,
+    isStreaming: false,
+    selectedTextForAI: '',
+    selectedPageForAI: 0,
+    selectedEndPageForAI: 0,
+    selectedRectsForAI: [],
+    documentFingerprint: '',
+    documentDigest: null,
+    digestStatus: 'extracting',
+    digestProgress: 'Extracting PDF text…',
+    digestError: '',
+    digestRebuildToken: 0,
+    digestCancelToken: 0,
+  };
+}
+
+function activateSession(session: DocumentTabSession, nextSessionId: number): Partial<AppState> {
+  return {
+    activeDocumentTabId: session.id,
+    pdfFile: session.pdfFile,
+    documentSessionId: nextSessionId,
+    pdfText: session.pdfText,
+    pageTexts: session.pageTexts,
+    extractedPageCount: session.extractedPageCount,
+    documentTextReady: session.documentTextReady,
+    numPages: session.numPages,
+    currentPage: session.currentPage,
+    zoom: session.zoom,
+    highlights: session.highlights,
+    annotations: session.annotations,
+    activeHighlightColor: session.activeHighlightColor,
+    activeTool: session.activeTool,
+    undoStack: session.undoStack,
+    redoStack: session.redoStack,
+    conversations: session.conversations,
+    activeConversation: session.activeConversation,
+    isStreaming: session.isStreaming,
+    selectedTextForAI: session.selectedTextForAI,
+    selectedPageForAI: session.selectedPageForAI,
+    selectedEndPageForAI: session.selectedEndPageForAI,
+    selectedRectsForAI: session.selectedRectsForAI,
+    documentFingerprint: session.documentFingerprint,
+    documentDigest: session.documentDigest,
+    digestStatus: session.digestStatus,
+    digestProgress: session.digestProgress,
+    digestError: session.digestError,
+    digestRebuildToken: session.digestRebuildToken,
+    digestCancelToken: session.digestCancelToken,
+  };
+}
+
 export const useStore = create<AppState>((set, get) => ({
   // ─── Initial State ───
 
+  documentTabs: [],
+  activeDocumentTabId: null,
+
   pdfFile: null,
+  documentSessionId: 0,
   pdfText: '',
   pageTexts: new Map(),
+  extractedPageCount: 0,
+  documentTextReady: false,
   numPages: 0,
   currentPage: 1,
   zoom: 1.0,
@@ -133,27 +310,152 @@ export const useStore = create<AppState>((set, get) => ({
   isStreaming: false,
   selectedTextForAI: '',
   selectedPageForAI: 0,
+  selectedEndPageForAI: 0,
   selectedRectsForAI: [],
+  documentFingerprint: '',
+  documentDigest: null,
+  digestStatus: 'idle',
+  digestProgress: '',
+  digestError: '',
+  digestRebuildToken: 0,
+  digestCancelToken: 0,
 
   sidebarOpen: true,
-  sidebarWidth: 420,
+  sidebarWidth: 700,
   sidebarTab: 'chat',
   settingsOpen: false,
   thumbnailSidebarOpen: true,
 
   settings: {
-    providers: { ...DEFAULT_PROVIDERS },
-    activeProvider: 'ollama',
-    sidebarOpen: true,
-    sidebarWidth: 420,
-    theme: 'dark',
-    sendFullPdfContext: true,
-    maxContextPages: 50,
+    ...DEFAULT_SETTINGS,
+    providers: Object.fromEntries(
+      Object.entries(DEFAULT_SETTINGS.providers).map(([id, provider]) => [
+        id,
+        { ...provider, models: [...provider.models] },
+      ])
+    ) as AppSettings['providers'],
   },
 
   // ─── PDF ───
 
-  setPdfFile: (file) => set({ pdfFile: file, highlights: [], annotations: [], currentPage: 1, pageTexts: new Map(), undoStack: [], redoStack: [] }),
+  setPdfFile: (file) => {
+    if (!file) get().documentTabs.forEach((tab) => abortChatRequest(tab.id));
+    set((state) => {
+    const captured = captureActiveSession(state);
+    let documentTabs = captured
+      ? state.documentTabs.map((tab) => tab.id === captured.id ? captured : tab)
+      : state.documentTabs;
+    if (!file) {
+      return {
+        documentTabs: [],
+        activeDocumentTabId: null,
+        pdfFile: null,
+        documentSessionId: state.documentSessionId + 1,
+        pdfText: '',
+        pageTexts: new Map(),
+        extractedPageCount: 0,
+        documentTextReady: false,
+        numPages: 0,
+        currentPage: 1,
+        zoom: 1,
+        highlights: [],
+        annotations: [],
+        undoStack: [],
+        redoStack: [],
+        conversations: [],
+        activeConversation: null,
+        isStreaming: false,
+        selectedTextForAI: '',
+        selectedPageForAI: 0,
+        selectedEndPageForAI: 0,
+        selectedRectsForAI: [],
+        documentFingerprint: '',
+        documentDigest: null,
+        digestStatus: 'idle',
+        digestProgress: '',
+        digestError: '',
+      };
+    }
+    const identity = documentIdentity(file);
+    const existing = documentTabs.find((tab) => tab.identity === identity);
+    if (existing) {
+      return {
+        documentTabs,
+        ...activateSession(existing, state.documentSessionId + 1),
+      };
+    }
+    const session = newDocumentSession(file);
+    documentTabs = [...documentTabs, session];
+    return {
+      documentTabs,
+      ...activateSession(session, state.documentSessionId + 1),
+    };
+    });
+  },
+  switchDocumentTab: (id) => set((state) => {
+    if (id === state.activeDocumentTabId) return state;
+    const captured = captureActiveSession(state);
+    const documentTabs = captured
+      ? state.documentTabs.map((tab) => tab.id === captured.id ? captured : tab)
+      : state.documentTabs;
+    const target = documentTabs.find((tab) => tab.id === id);
+    if (!target) return state;
+    return {
+      documentTabs,
+      ...activateSession(target, state.documentSessionId + 1),
+    };
+  }),
+  closeDocumentTab: (id) => {
+    abortChatRequest(id);
+    set((state) => {
+      const captured = captureActiveSession(state);
+      const synchronizedTabs = captured
+        ? state.documentTabs.map((tab) => tab.id === captured.id ? captured : tab)
+        : state.documentTabs;
+      const closingIndex = synchronizedTabs.findIndex((tab) => tab.id === id);
+      if (closingIndex < 0) return state;
+      const documentTabs = synchronizedTabs.filter((tab) => tab.id !== id);
+      if (id !== state.activeDocumentTabId) return { documentTabs };
+      const nextTab = documentTabs[Math.min(closingIndex, documentTabs.length - 1)];
+      if (nextTab) {
+        return {
+          documentTabs,
+          ...activateSession(nextTab, state.documentSessionId + 1),
+        };
+      }
+      return {
+        documentTabs: [],
+        activeDocumentTabId: null,
+        pdfFile: null,
+        documentSessionId: state.documentSessionId + 1,
+        pdfText: '',
+        pageTexts: new Map(),
+        extractedPageCount: 0,
+        documentTextReady: false,
+        numPages: 0,
+        currentPage: 1,
+        highlights: [],
+        annotations: [],
+        undoStack: [],
+        redoStack: [],
+        conversations: [],
+        activeConversation: null,
+        isStreaming: false,
+        selectedTextForAI: '',
+        selectedPageForAI: 0,
+        selectedEndPageForAI: 0,
+        selectedRectsForAI: [],
+        documentFingerprint: '',
+        documentDigest: null,
+        digestStatus: 'idle',
+        digestProgress: '',
+        digestError: '',
+      };
+    });
+  },
+  updateCurrentPdfData: (data) => set((state) => ({
+    pdfFile: state.pdfFile ? { ...state.pdfFile, data } : null,
+  })),
   setPdfText: (text) => set({ pdfText: text }),
   setPageText: (page, text) =>
     set((s) => {
@@ -161,6 +463,33 @@ export const useStore = create<AppState>((set, get) => ({
       newMap.set(page, text);
       return { pageTexts: newMap };
     }),
+  setExtractionProgress: (extractedPageCount, documentTextReady = false) => set({
+    extractedPageCount,
+    documentTextReady,
+    digestStatus: documentTextReady ? 'idle' : 'extracting',
+    digestProgress: documentTextReady
+      ? 'PDF text extraction complete'
+      : `Extracting PDF text — page ${extractedPageCount}`,
+  }),
+  setDocumentFingerprint: (documentFingerprint) => set({ documentFingerprint }),
+  setDocumentDigest: (documentDigest) => set({ documentDigest }),
+  setDigestState: (digestStatus, digestProgress = '', digestError = '') => set({
+    digestStatus,
+    digestProgress,
+    digestError,
+  }),
+  rebuildDocumentDigest: () => set((state) => ({
+    documentDigest: null,
+    digestError: '',
+    digestStatus: state.documentTextReady ? 'loading' : 'extracting',
+    digestProgress: 'Rebuilding document digest…',
+    digestRebuildToken: state.digestRebuildToken + 1,
+  })),
+  cancelDocumentDigest: () => set((state) => ({
+    digestStatus: 'cancelled',
+    digestProgress: 'Document digest generation cancelled',
+    digestCancelToken: state.digestCancelToken + 1,
+  })),
   setNumPages: (n) => set({ numPages: n }),
   setCurrentPage: (p) => set({ currentPage: p }),
   setZoom: (z) => set({ zoom: Math.max(0.25, Math.min(5, z)) }),
@@ -275,8 +604,18 @@ export const useStore = create<AppState>((set, get) => ({
 
   // ─── AI ───
 
-  setSelectedTextForAI: (text, page, rects = []) => set({ selectedTextForAI: text, selectedPageForAI: page, selectedRectsForAI: rects }),
-  clearSelectedTextForAI: () => set({ selectedTextForAI: '', selectedPageForAI: 0, selectedRectsForAI: [] }),
+  setSelectedTextForAI: (text, page, rects = [], endPage = page) => set({
+    selectedTextForAI: text,
+    selectedPageForAI: page,
+    selectedEndPageForAI: endPage,
+    selectedRectsForAI: rects,
+  }),
+  clearSelectedTextForAI: () => set({
+    selectedTextForAI: '',
+    selectedPageForAI: 0,
+    selectedEndPageForAI: 0,
+    selectedRectsForAI: [],
+  }),
   newConversation: () => {
     const id = uid();
     const conv: ChatConversation = {
@@ -291,9 +630,10 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     return id;
   },
-  addMessage: (convId, msg) =>
-    set((s) => ({
-      conversations: s.conversations.map((c) =>
+  addMessage: (convId, msg, documentTabId) =>
+    set((s) => {
+      const targetTabId = documentTabId || s.activeDocumentTabId;
+      const addTo = (conversations: ChatConversation[]) => conversations.map((c) =>
         c.id === convId
           ? {
               ...c,
@@ -304,11 +644,20 @@ export const useStore = create<AppState>((set, get) => ({
                   : c.title,
             }
           : c
-      ),
-    })),
-  updateLastAssistantMessage: (convId, content) =>
-    set((s) => ({
-      conversations: s.conversations.map((c) => {
+      );
+      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
+        return { conversations: addTo(s.conversations) };
+      }
+      return {
+        documentTabs: s.documentTabs.map((tab) =>
+          tab.id === targetTabId ? { ...tab, conversations: addTo(tab.conversations) } : tab
+        ),
+      };
+    }),
+  updateLastAssistantMessage: (convId, content, documentTabId) =>
+    set((s) => {
+      const targetTabId = documentTabId || s.activeDocumentTabId;
+      const update = (conversations: ChatConversation[]) => conversations.map((c) => {
         if (c.id !== convId) return c;
         const msgs = [...c.messages];
         for (let i = msgs.length - 1; i >= 0; i--) {
@@ -318,21 +667,52 @@ export const useStore = create<AppState>((set, get) => ({
           }
         }
         return { ...c, messages: msgs };
-      }),
-    })),
+      });
+      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
+        return { conversations: update(s.conversations) };
+      }
+      return {
+        documentTabs: s.documentTabs.map((tab) =>
+          tab.id === targetTabId ? { ...tab, conversations: update(tab.conversations) } : tab
+        ),
+      };
+    }),
   setActiveConversation: (id) => set({ activeConversation: id }),
-  setIsStreaming: (v) => set({ isStreaming: v }),
+  setIsStreaming: (v, documentTabId) => set((s) => {
+    const targetTabId = documentTabId || s.activeDocumentTabId;
+    if (!targetTabId || targetTabId === s.activeDocumentTabId) return { isStreaming: v };
+    return {
+      documentTabs: s.documentTabs.map((tab) =>
+        tab.id === targetTabId ? { ...tab, isStreaming: v } : tab
+      ),
+    };
+  }),
   deleteConversation: (id) =>
-    set((s) => ({
-      conversations: s.conversations.filter((c) => c.id !== id),
-      activeConversation: s.activeConversation === id ? null : s.activeConversation,
-    })),
+    set((s) => {
+      const removedIndex = s.conversations.findIndex((conversation) => conversation.id === id);
+      const conversations = s.conversations.filter((conversation) => conversation.id !== id);
+      if (s.activeConversation !== id) return { conversations };
+      const nextIndex = Math.min(Math.max(0, removedIndex), Math.max(0, conversations.length - 1));
+      return {
+        conversations,
+        activeConversation: conversations[nextIndex]?.id || null,
+      };
+    }),
 
   // ─── UI ───
 
-  toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
-  setSidebarOpen: (v) => set({ sidebarOpen: v }),
-  setSidebarWidth: (w) => set({ sidebarWidth: Math.max(320, Math.min(800, w)) }),
+  toggleSidebar: () => set((s) => {
+    const sidebarOpen = !s.sidebarOpen;
+    return { sidebarOpen, settings: { ...s.settings, sidebarOpen } };
+  }),
+  setSidebarOpen: (v) => set((s) => ({
+    sidebarOpen: v,
+    settings: { ...s.settings, sidebarOpen: v },
+  })),
+  setSidebarWidth: (w) => set((s) => {
+    const sidebarWidth = Math.max(320, Math.min(1200, Math.round(w)));
+    return { sidebarWidth, settings: { ...s.settings, sidebarWidth } };
+  }),
   setSidebarTab: (t) => set({ sidebarTab: t }),
   setSettingsOpen: (v) => set({ settingsOpen: v }),
   toggleThumbnailSidebar: () => set((s) => ({ thumbnailSidebarOpen: !s.thumbnailSidebarOpen })),
@@ -340,6 +720,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   // ─── Settings ───
 
+  hydrateSettings: (settings) => set({
+    settings,
+    sidebarOpen: settings.sidebarOpen,
+    sidebarWidth: settings.sidebarWidth,
+  }),
   updateSettings: (s) => set((state) => ({ settings: { ...state.settings, ...s } })),
   setActiveProvider: (p) =>
     set((s) => ({ settings: { ...s.settings, activeProvider: p } })),

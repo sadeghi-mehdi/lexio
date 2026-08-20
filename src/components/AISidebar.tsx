@@ -3,19 +3,110 @@ import {
   Send,
   Square,
   Plus,
-  Trash2,
   MessageSquare,
   BookMarked,
   Sparkles,
   ChevronDown,
   X,
   FileText,
-  Lightbulb,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { useStore } from '../stores/useStore';
-import { providers, buildSystemPrompt } from '../providers/ai-providers';
-import type { ChatMessage, AIProvider, HighlightColor } from '../types';
+import { providers, type AIProviderInterface } from '../providers/ai-providers';
+import type { ChatMessage, AIProvider, ProviderConfig } from '../types';
+import {
+  buildContextSystemPrompt,
+  buildDocumentContext,
+  chooseDocumentAwareStrategy,
+  chunkDocument,
+  groupTextsWithinBudget,
+} from '../utils/document-context';
+import { retrieveDigestContext } from '../utils/document-digest';
+import { requestProviderText } from '../utils/provider-request';
+import {
+  abortChatRequest,
+  clearChatRequest,
+  registerChatRequest,
+} from '../utils/chat-request-registry';
 import AnnotationsPanel from './AnnotationsPanel';
+import { copyText } from '../utils/clipboard';
+
+const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+
+async function summarizeDocumentHierarchically({
+  pageTexts,
+  maxChars,
+  provider,
+  config,
+  customInstructions,
+  signal,
+  onProgress,
+}: {
+  pageTexts: ReadonlyMap<number, string>;
+  maxChars: number;
+  provider: AIProviderInterface;
+  config: ProviderConfig;
+  customInstructions: string;
+  signal: AbortSignal;
+  onProgress: (status: string) => void;
+}): Promise<string> {
+  const chunks = chunkDocument(pageTexts, maxChars);
+  let summaries: string[] = [];
+
+  for (let index = 0; index < chunks.length; index++) {
+    const chunk = chunks[index];
+    onProgress(`Summarizing section ${index + 1} of ${chunks.length} (pages ${chunk.startPage}–${chunk.endPage})…`);
+    const summary = await requestProviderText(
+      provider,
+      [{
+        id: `summary-${index}`,
+        role: 'user',
+        content: 'Summarize this section faithfully. Preserve methods, findings, numerical results, limitations, recommendations, and page references. Do not add unsupported claims.',
+        timestamp: Date.now(),
+      }],
+      buildContextSystemPrompt(
+        chunk.text,
+        `pages ${chunk.startPage}–${chunk.endPage}`,
+        customInstructions
+      ),
+      config,
+      signal
+    );
+    summaries.push(`--- Summary of pages ${chunk.startPage}–${chunk.endPage} ---\n${summary}`);
+  }
+
+  let reductionPass = 1;
+  while (summaries.join('\n\n').length > Math.floor(maxChars * 0.8) && reductionPass <= 6) {
+    const groups = groupTextsWithinBudget(summaries, maxChars);
+    const reduced: string[] = [];
+    for (let index = 0; index < groups.length; index++) {
+      onProgress(`Consolidating summary ${index + 1} of ${groups.length}…`);
+      const combined = groups[index].join('\n\n');
+      const summary = await requestProviderText(
+        provider,
+        [{
+          id: `reduction-${reductionPass}-${index}`,
+          role: 'user',
+          content: 'Consolidate these section summaries without losing major findings, quantitative results, limitations, recommendations, or page references.',
+          timestamp: Date.now(),
+        }],
+        buildContextSystemPrompt(
+          combined,
+          'structured summaries covering the document',
+          customInstructions
+        ),
+        config,
+        signal
+      );
+      reduced.push(summary);
+    }
+    summaries = reduced;
+    reductionPass++;
+  }
+
+  return summaries.join('\n\n').slice(0, maxChars);
+}
 
 export default function AISidebar() {
   const {
@@ -24,11 +115,20 @@ export default function AISidebar() {
     isStreaming,
     selectedTextForAI,
     selectedPageForAI,
+    selectedEndPageForAI,
     selectedRectsForAI,
-    pdfText,
+    pdfFile,
+    documentSessionId,
+    pageTexts,
+    extractedPageCount,
+    documentTextReady,
+    numPages,
+    documentDigest,
+    digestStatus,
+    digestProgress,
+    digestError,
     sidebarTab,
     settings,
-    activeHighlightColor,
     newConversation,
     addMessage,
     updateLastAssistantMessage,
@@ -38,17 +138,19 @@ export default function AISidebar() {
     clearSelectedTextForAI,
     setSidebarTab,
     setActiveProvider,
-    addHighlight,
+    rebuildDocumentDigest,
+    cancelDocumentDigest,
   } = useStore();
 
   const [input, setInput] = useState('');
   const [showProviderMenu, setShowProviderMenu] = useState(false);
+  const [contextStatus, setContextStatus] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
 
   const activeConv = conversations.find((c) => c.id === activeConversation);
   const activeProviderConfig = settings.providers[settings.activeProvider];
+  const documentQuestionReady = documentTextReady;
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -62,105 +164,219 @@ export default function AISidebar() {
     }
   }, [selectedTextForAI]);
 
+  useEffect(() => {
+    setContextStatus(null);
+    setInput('');
+  }, [documentSessionId]);
+
   const sendMessage = useCallback(async () => {
     const text = input.trim();
     if ((!text && !selectedTextForAI) || isStreaming) return;
+    if (!selectedTextForAI && !documentTextReady) return;
+    const requestTabId = useStore.getState().activeDocumentTabId;
+    if (!requestTabId) return;
+    const requestTabIsActive = () => useStore.getState().activeDocumentTabId === requestTabId;
 
-    // Ensure we have a conversation
+    const selectionText = selectedTextForAI;
+    const selectionPage = selectedPageForAI;
+    const selectionEndPage = selectedEndPageForAI || selectionPage;
+    const selectionRects = [...selectedRectsForAI];
+
     let convId = activeConversation;
     if (!convId) {
       convId = newConversation();
     }
 
-    const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+    const fullContent = selectionText
+      ? text || 'Please explain the selected passage.'
+      : text;
 
-    // Build the full message content including context
-    let fullContent = text;
-    if (selectedTextForAI) {
-      if (text) {
-        fullContent = `Regarding this passage from page ${selectedPageForAI}:\n\n"${selectedTextForAI}"\n\n${text}`;
-      } else {
-        fullContent = `Please explain this passage from page ${selectedPageForAI}:\n\n"${selectedTextForAI}"`;
-      }
-    }
-
-    // Add user message (with context info for display and key points extraction)
     const userMsg: ChatMessage & { rects?: typeof selectedRectsForAI } = {
       id: uid(),
       role: 'user',
       content: fullContent,
       timestamp: Date.now(),
-      selectedText: selectedTextForAI || undefined,
-      pageNumber: selectedTextForAI ? selectedPageForAI : undefined,
+      selectedText: selectionText || undefined,
+      pageNumber: selectionText ? selectionPage : undefined,
+      pageEndNumber: selectionText ? selectionEndPage : undefined,
     };
-    // Store rects for key points extraction
-    if (selectedRectsForAI.length > 0) {
-      (userMsg as any).rects = [...selectedRectsForAI];
+    if (selectionRects.length > 0) {
+      (userMsg as any).rects = selectionRects;
     }
-    addMessage(convId, userMsg);
+    addMessage(convId, userMsg, requestTabId);
     setInput('');
-
-    // Clear the selected text context
     clearSelectedTextForAI();
 
-    // Add placeholder assistant message
     const assistantMsg: ChatMessage = {
       id: uid(),
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
+      providerId: settings.activeProvider,
+      model: activeProviderConfig.model,
     };
-    addMessage(convId, assistantMsg);
-    setIsStreaming(true);
+    addMessage(convId, assistantMsg, requestTabId);
+    setIsStreaming(true, requestTabId);
 
     const abort = new AbortController();
-    abortRef.current = abort;
+    registerChatRequest(requestTabId, abort);
 
     try {
-      const conv = useStore.getState().conversations.find((c) => c.id === convId);
-      // Get all messages except system messages, then remove the empty assistant placeholder at the end
+      const state = useStore.getState();
+      const conv = state.conversations.find((c) => c.id === convId);
       const allMessages = conv?.messages.filter((m) => m.role !== 'system') || [];
-      // Remove the empty assistant placeholder from messages sent to API
       const apiMessages = allMessages.slice(0, -1).filter((m) => m.content);
-
-      const systemPrompt = buildSystemPrompt(pdfText);
       const provider = providers[settings.activeProvider];
 
+      if (!activeProviderConfig.enabled) {
+        throw new Error(`${activeProviderConfig.name} is disabled. Enable it in Settings before sending a message.`);
+      }
+
+      if (!selectionText && state.pageTexts.size === 0) {
+        throw new Error('No extractable PDF text is available yet. Wait for loading to finish or select a passage.');
+      }
+
       if (!provider) {
-        updateLastAssistantMessage(convId, '⚠️ Provider not found. Check your settings.');
-        setIsStreaming(false);
+        updateLastAssistantMessage(convId, '⚠️ Provider not found. Check your settings.', requestTabId);
+        setIsStreaming(false, requestTabId);
         return;
       }
 
-      let accumulated = '';
+      const maxContextChars = Math.max(
+        10000,
+        Math.min(2000000, Math.round(settings.maxContextChars))
+      );
 
-      await provider.chat(apiMessages, systemPrompt, activeProviderConfig, abort.signal, {
-        onToken: (token) => {
-          accumulated += token;
-          updateLastAssistantMessage(convId!, accumulated);
-        },
-        onDone: () => {},
-        onError: (err) => {
-          updateLastAssistantMessage(convId!, `⚠️ Error: ${err.message}`);
-        },
-      });
+      let contextText = '';
+      let contextDescription = '';
+      if (selectionText) {
+        const context = buildDocumentContext({
+          pageTexts: state.pageTexts,
+          mode: 'selection',
+          query: text || fullContent,
+          maxChars: maxContextChars,
+          selectedPage: selectionPage,
+          selectedEndPage: selectionEndPage,
+          selectedText: selectionText,
+        });
+        contextText = context.text;
+        contextDescription = context.description;
+      } else if (settings.contextMode === 'rawEntire') {
+        const context = buildDocumentContext({
+          pageTexts: state.pageTexts,
+          mode: 'entire',
+          query: text,
+          maxChars: maxContextChars,
+        });
+        contextText = context.text;
+        contextDescription = context.description;
+        if (context.requiresHierarchicalSummary) {
+          contextDescription = `fresh hierarchical summaries of the entire ${state.pageTexts.size}-page document`;
+          contextText = await summarizeDocumentHierarchically({
+            pageTexts: state.pageTexts,
+            maxChars: maxContextChars,
+            provider,
+            config: activeProviderConfig,
+            customInstructions: settings.customInstructions,
+            signal: abort.signal,
+            onProgress: (status) => {
+              if (requestTabIsActive()) setContextStatus(status);
+              updateLastAssistantMessage(convId!, status, requestTabId);
+            },
+          });
+        }
+      } else {
+        const completeContext = buildDocumentContext({
+          pageTexts: state.pageTexts,
+          mode: 'entire',
+          query: text,
+          maxChars: maxContextChars,
+        });
+        const strategy = chooseDocumentAwareStrategy(
+          text,
+          completeContext.requiresHierarchicalSummary,
+          Boolean(state.documentDigest)
+        );
+        if (strategy === 'entire-original') {
+          contextText = completeContext.text;
+          contextDescription = `the complete original text of the ${completeContext.pages.length}-page document`;
+        } else if (strategy === 'hierarchical-summary') {
+          contextDescription = `complete hierarchical summaries of the entire ${state.pageTexts.size}-page document`;
+          contextText = await summarizeDocumentHierarchically({
+            pageTexts: state.pageTexts,
+            maxChars: maxContextChars,
+            provider,
+            config: activeProviderConfig,
+            customInstructions: settings.customInstructions,
+            signal: abort.signal,
+            onProgress: (status) => {
+              if (requestTabIsActive()) setContextStatus(status);
+              updateLastAssistantMessage(convId!, status, requestTabId);
+            },
+          });
+        } else if (strategy === 'indexed-retrieval' && state.documentDigest) {
+          const digest = state.documentDigest;
+          const retrieval = retrieveDigestContext({
+            digest,
+            pageTexts: state.pageTexts,
+            query: text,
+            maxChars: maxContextChars,
+            maxRanges: settings.maxRetrievedRanges,
+          });
+          contextText = retrieval.text;
+          contextDescription = retrieval.description;
+        } else {
+          const fallback = buildDocumentContext({
+            pageTexts: state.pageTexts,
+            mode: 'relevant',
+            query: text,
+            maxChars: maxContextChars,
+          });
+          contextText = fallback.text;
+          contextDescription = `${fallback.description} selected directly from the original PDF while the page index is unavailable`;
+        }
+      }
+
+      if (requestTabIsActive()) setContextStatus(`Using ${contextDescription}`);
+      const systemPrompt = buildContextSystemPrompt(
+        contextText,
+        contextDescription,
+        settings.customInstructions
+      );
+
+      await requestProviderText(
+        provider,
+        apiMessages,
+        systemPrompt,
+        activeProviderConfig,
+        abort.signal,
+        (accumulated) => updateLastAssistantMessage(convId!, accumulated, requestTabId)
+      );
     } catch (err: any) {
       if (err.name !== 'AbortError') {
-        updateLastAssistantMessage(convId, `⚠️ Error: ${err.message}`);
+        updateLastAssistantMessage(convId, `⚠️ Error: ${err.message}`, requestTabId);
       }
     } finally {
-      setIsStreaming(false);
-      abortRef.current = null;
+      setIsStreaming(false, requestTabId);
+      if (requestTabIsActive()) setContextStatus(null);
+      clearChatRequest(requestTabId, abort);
     }
   }, [
     input,
     isStreaming,
     activeConversation,
-    pdfText,
+    pageTexts,
+    documentDigest,
+    documentTextReady,
     settings.activeProvider,
+    settings.contextMode,
+    settings.maxContextChars,
+    settings.maxRetrievedRanges,
+    settings.customInstructions,
     activeProviderConfig,
     selectedTextForAI,
     selectedPageForAI,
+    selectedEndPageForAI,
     selectedRectsForAI,
     newConversation,
     addMessage,
@@ -169,102 +385,10 @@ export default function AISidebar() {
     clearSelectedTextForAI,
   ]);
 
-  // Extract key points from the last AI response and add as a comment
-  const extractKeyPoints = useCallback(async () => {
-    if (!activeConv || isStreaming) return;
-
-    // Find the last assistant message
-    const lastAssistantMsg = [...activeConv.messages].reverse().find(m => m.role === 'assistant' && m.content);
-    // Find the corresponding user message with context
-    const userMsgWithContext = [...activeConv.messages].reverse().find(m => m.role === 'user' && m.selectedText);
-
-    if (!lastAssistantMsg || !userMsgWithContext?.selectedText || !userMsgWithContext.pageNumber) {
-      return;
-    }
-
-    // We need to get the rects - if we don't have them, we can't create a highlight
-    // For now, we'll store rects in the user message
-    const storedRects = (userMsgWithContext as any).rects;
-
-    // Ask AI to extract key points
-    const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-    const convId = activeConv.id;
-
-    // Add a user message asking for key points
-    const extractMsg: ChatMessage = {
-      id: uid(),
-      role: 'user',
-      content: 'Please summarize the above explanation in 2-3 concise bullet points that capture the key insights.',
-      timestamp: Date.now(),
-    };
-    addMessage(convId, extractMsg);
-
-    // Add placeholder assistant message
-    const assistantMsg: ChatMessage = {
-      id: uid(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-    };
-    addMessage(convId, assistantMsg);
-    setIsStreaming(true);
-
-    const abort = new AbortController();
-    abortRef.current = abort;
-
-    try {
-      const conv = useStore.getState().conversations.find((c) => c.id === convId);
-      const allMessages = conv?.messages.filter((m) => m.role !== 'system') || [];
-      const apiMessages = allMessages.slice(0, -1).filter((m) => m.content);
-
-      const systemPrompt = buildSystemPrompt(pdfText);
-      const provider = providers[settings.activeProvider];
-
-      if (!provider) {
-        updateLastAssistantMessage(convId, 'Provider not found.');
-        setIsStreaming(false);
-        return;
-      }
-
-      let accumulated = '';
-
-      await provider.chat(apiMessages, systemPrompt, activeProviderConfig, abort.signal, {
-        onToken: (token) => {
-          accumulated += token;
-          updateLastAssistantMessage(convId!, accumulated);
-        },
-        onDone: () => {
-          // Create a highlight with the key points as a comment
-          if (accumulated && storedRects && storedRects.length > 0) {
-            addHighlight({
-              id: Math.random().toString(36).substring(2, 10),
-              page: userMsgWithContext.pageNumber!,
-              rects: storedRects,
-              text: userMsgWithContext.selectedText!,
-              color: activeHighlightColor,
-              type: 'highlight',
-              comment: accumulated,
-              createdAt: Date.now(),
-            });
-          }
-        },
-        onError: (err) => {
-          updateLastAssistantMessage(convId!, `Error: ${err.message}`);
-        },
-      });
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        updateLastAssistantMessage(convId, `Error: ${err.message}`);
-      }
-    } finally {
-      setIsStreaming(false);
-      abortRef.current = null;
-    }
-  }, [activeConv, isStreaming, pdfText, settings.activeProvider, activeProviderConfig, activeHighlightColor, addMessage, updateLastAssistantMessage, setIsStreaming, addHighlight]);
-
   const stopStreaming = () => {
-    abortRef.current?.abort();
-    setIsStreaming(false);
+    const tabId = useStore.getState().activeDocumentTabId;
+    if (tabId) abortChatRequest(tabId);
+    setIsStreaming(false, tabId);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -297,13 +421,14 @@ export default function AISidebar() {
           {/* Provider selector + conversation list */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-3 flex-shrink-0">
             {/* Provider dropdown */}
-            <div className="relative">
+            <div className="relative flex items-center">
               <button
                 onClick={() => setShowProviderMenu(!showProviderMenu)}
                 className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs bg-surface-2 text-text-secondary hover:bg-surface-3 transition-colors"
               >
-                <span className={`w-1.5 h-1.5 rounded-full ${activeProviderConfig.enabled || activeProviderConfig.id === 'ollama' ? 'bg-emerald-400' : 'bg-red-400'}`} />
-                {activeProviderConfig.name}
+                <span className={`w-1.5 h-1.5 rounded-full ${activeProviderConfig.enabled ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                <span>{activeProviderConfig.name}</span>
+                <span className="max-w-[150px] truncate text-text-muted">· {activeProviderConfig.model}</span>
                 <ChevronDown size={12} />
               </button>
 
@@ -322,7 +447,7 @@ export default function AISidebar() {
                           id === settings.activeProvider ? 'text-accent-light' : 'text-text-secondary'
                         }`}
                       >
-                        <span className={`w-1.5 h-1.5 rounded-full ${p.enabled || p.id === 'ollama' ? 'bg-emerald-400' : 'bg-surface-4'}`} />
+                        <span className={`w-1.5 h-1.5 rounded-full ${p.enabled ? 'bg-emerald-400' : 'bg-surface-4'}`} />
                         {p.name}
                         <span className="text-text-muted ml-auto">{p.model}</span>
                       </button>
@@ -347,31 +472,52 @@ export default function AISidebar() {
           </div>
 
           {/* Conversation tabs */}
-          {conversations.length > 1 && (
+          {conversations.length > 0 && (
             <div className="flex gap-1 px-3 py-1.5 border-b border-surface-3 overflow-x-auto flex-shrink-0">
-              {conversations.map((conv) => (
-                <button
+              {conversations.map((conv) => {
+                const isActive = conv.id === activeConversation;
+                return (
+                <div
                   key={conv.id}
-                  onClick={() => setActiveConversation(conv.id)}
-                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs whitespace-nowrap transition-colors ${
-                    conv.id === activeConversation
+                  className={`group flex items-center rounded text-xs whitespace-nowrap transition-colors ${
+                    isActive
                       ? 'bg-accent/20 text-accent-light'
                       : 'text-text-muted hover:bg-surface-3 hover:text-text-secondary'
                   }`}
                 >
-                  <MessageSquare size={11} />
-                  <span className="max-w-[120px] truncate">{conv.title}</span>
-                  <span
-                    onClick={(e) => {
-                      e.stopPropagation();
+                  <button
+                    onClick={() => setActiveConversation(conv.id)}
+                    className="flex min-w-0 items-center gap-1 py-1 pl-2"
+                    title={conv.title}
+                  >
+                    <MessageSquare size={11} className="flex-shrink-0" />
+                    <span className="max-w-[120px] truncate">{conv.title}</span>
+                  </button>
+                  <button
+                    aria-label={`Close chat: ${conv.title}`}
+                    title="Close chat"
+                    onClick={() => {
+                      if (isActive && isStreaming) {
+                        const tabId = useStore.getState().activeDocumentTabId;
+                        if (tabId) abortChatRequest(tabId);
+                        setIsStreaming(false, tabId);
+                      }
                       deleteConversation(conv.id);
                     }}
-                    className="ml-1 opacity-0 group-hover:opacity-100 hover:text-red-400"
+                    className={`mx-1 rounded p-0.5 hover:bg-red-500/10 hover:text-red-400 focus:opacity-100 ${
+                      isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                    }`}
                   >
                     <X size={10} />
-                  </span>
-                </button>
-              ))}
+                  </button>
+                </div>
+              );})}
+            </div>
+          )}
+
+          {contextStatus && (
+            <div className="flex-shrink-0 border-b border-surface-3 bg-accent/5 px-3 py-1.5 text-[11px] text-accent-light">
+              {contextStatus}
             </div>
           )}
 
@@ -387,13 +533,41 @@ export default function AISidebar() {
 
           {/* Input */}
           <div className="flex-shrink-0 p-3 border-t border-surface-3">
+            {pdfFile && settings.contextMode === 'rawEntire' && !documentTextReady && !selectedTextForAI && (
+              <div className="mb-2 rounded-lg border border-accent/20 bg-accent/5 px-2.5 py-2 text-[11px] text-accent-light">
+                Extracting PDF text… {extractedPageCount} / {numPages || '…'} pages.
+              </div>
+            )}
+            {pdfFile && settings.contextMode === 'documentAware' && !selectedTextForAI && digestStatus !== 'ready' && (
+              <div className={`mb-2 rounded-lg border px-2.5 py-2 text-[11px] ${
+                digestStatus === 'error'
+                  ? 'border-red-500/30 bg-red-500/5 text-red-300'
+                  : 'border-accent/20 bg-accent/5 text-accent-light'
+              }`}>
+                <div>{digestError || digestProgress || 'Preparing reusable document digest…'}</div>
+                {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
+                  <button onClick={cancelDocumentDigest} className="mt-1 underline hover:text-text-primary">
+                    Cancel digest generation
+                  </button>
+                )}
+                {(digestStatus === 'error' || digestStatus === 'cancelled') && (
+                  <button onClick={rebuildDocumentDigest} className="mt-1 underline hover:text-text-primary">
+                    Build digest again
+                  </button>
+                )}
+              </div>
+            )}
             {/* Selected text context card */}
             {selectedTextForAI && (
               <div className="mb-2 p-2 bg-accent/10 border border-accent/20 rounded-lg">
                 <div className="flex items-center justify-between mb-1">
                   <div className="flex items-center gap-1.5 text-accent-light">
                     <FileText size={12} />
-                    <span className="text-[10px] uppercase tracking-wider">Page {selectedPageForAI}</span>
+                    <span className="text-[10px] uppercase tracking-wider">
+                      {selectedEndPageForAI && selectedEndPageForAI !== selectedPageForAI
+                        ? `Pages ${selectedPageForAI}–${selectedEndPageForAI}`
+                        : `Page ${selectedPageForAI}`}
+                    </span>
                   </div>
                   <button
                     onClick={clearSelectedTextForAI}
@@ -414,15 +588,18 @@ export default function AISidebar() {
                 onKeyDown={handleKeyDown}
                 placeholder={selectedTextForAI ? "Ask about this passage…" : "Ask about the document…"}
                 rows={Math.min(6, Math.max(1, input.split('\n').length))}
-                className="w-full bg-surface-2 text-text-primary text-sm rounded-xl px-4 py-3 pr-12 resize-none outline-none border border-surface-3 focus:border-accent/40 transition-colors placeholder-text-muted"
+                className="block w-full bg-surface-2 text-text-primary text-sm leading-5 rounded-xl px-4 py-3 pr-12 resize-none outline-none border border-surface-3 focus:border-accent/40 transition-colors placeholder-text-muted"
               />
               <button
                 onClick={isStreaming ? stopStreaming : sendMessage}
-                disabled={!input.trim() && !isStreaming}
-                className={`absolute right-2 bottom-2 p-2 rounded-lg transition-colors ${
+                disabled={
+                  (!input.trim() && !selectedTextForAI && !isStreaming) ||
+                  (!selectedTextForAI && !documentQuestionReady && !isStreaming)
+                }
+                className={`absolute inset-y-0 right-2 my-auto flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-colors ${
                   isStreaming
                     ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                    : input.trim() || selectedTextForAI
+                    : (input.trim() || selectedTextForAI) && (selectedTextForAI || documentQuestionReady)
                       ? 'bg-accent/20 text-accent-light hover:bg-accent/30'
                       : 'text-text-muted cursor-not-allowed'
                 }`}
@@ -431,16 +608,6 @@ export default function AISidebar() {
               </button>
             </div>
 
-            {/* Key Points button - show when there's a conversation with context */}
-            {activeConv && activeConv.messages.some(m => m.selectedText) && !isStreaming && (
-              <button
-                onClick={extractKeyPoints}
-                className="mt-2 w-full flex items-center justify-center gap-2 px-3 py-2 text-xs bg-surface-2 text-text-secondary hover:text-accent-light hover:bg-surface-3 rounded-lg transition-colors"
-              >
-                <Lightbulb size={14} />
-                Extract key points as comment
-              </button>
-            )}
           </div>
         </>
       ) : (
@@ -480,9 +647,23 @@ function TabButton({
 
 function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user';
+  const [copied, setCopied] = useState(false);
+
+  const copyMessage = async () => {
+    try {
+      await copyText(message.content);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (error) {
+      console.error('Failed to copy chat message:', error);
+    }
+  };
 
   return (
-    <div className={`chat-message flex ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div className={`chat-message flex items-end gap-1 ${isUser ? 'justify-end' : 'justify-start'}`}>
+      {isUser && message.content && (
+        <MessageCopyButton copied={copied} isUser onClick={copyMessage} />
+      )}
       <div
         className={`max-w-[90%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
           isUser
@@ -490,6 +671,16 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             : 'bg-surface-2 text-text-primary rounded-bl-md'
         }`}
       >
+        {isUser && message.selectedText && (
+          <div className="mb-2 rounded-lg border border-accent/20 bg-surface-1/50 px-2.5 py-2 text-xs text-text-secondary">
+            <div className="mb-1 text-[10px] uppercase tracking-wider text-accent-light">
+              {message.pageEndNumber && message.pageNumber && message.pageEndNumber !== message.pageNumber
+                ? `Selected passage · pages ${message.pageNumber}–${message.pageEndNumber}`
+                : `Selected passage${message.pageNumber ? ` · page ${message.pageNumber}` : ''}`}
+            </div>
+            <div className="line-clamp-3 whitespace-pre-wrap">“{message.selectedText}”</div>
+          </div>
+        )}
         {message.content ? (
           <div
             className="whitespace-pre-wrap break-words"
@@ -504,8 +695,38 @@ function ChatBubble({ message }: { message: ChatMessage }) {
             <span />
           </div>
         )}
+        {!isUser && message.model && (
+          <div className="mt-2 border-t border-surface-3/70 pt-1.5 text-[10px] text-text-muted">
+            {message.providerId ? `${message.providerId} · ` : ''}{message.model}
+          </div>
+        )}
       </div>
+      {!isUser && message.content && (
+        <MessageCopyButton copied={copied} isUser={false} onClick={copyMessage} />
+      )}
     </div>
+  );
+}
+
+function MessageCopyButton({
+  copied,
+  isUser,
+  onClick,
+}: {
+  copied: boolean;
+  isUser: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-3 hover:text-text-primary"
+      title={copied ? 'Copied' : isUser ? 'Copy your message' : 'Copy AI response'}
+      aria-label={copied ? 'Message copied' : isUser ? 'Copy your message' : 'Copy AI response'}
+    >
+      {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
   );
 }
 
@@ -517,8 +738,8 @@ function EmptyChat() {
       </div>
       <p className="text-sm text-text-secondary font-medium mb-1">Ask about your document</p>
       <p className="text-xs text-text-muted leading-relaxed">
-        Select text in the PDF and click "Ask AI", or type a question below. The AI has access to
-        the full document for context.
+        Select text and click "Ask AI", or type a question below. Document-aware mode reuses the
+        cached digest to find and send original source page ranges.
       </p>
     </div>
   );

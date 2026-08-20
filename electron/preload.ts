@@ -8,6 +8,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   savePdfInPlace: (path: string, base64Data: string) => ipcRenderer.invoke('fs:save-pdf-inplace', path, base64Data),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings: object) => ipcRenderer.invoke('settings:save', settings),
+  loadDigest: (fingerprint: string) => ipcRenderer.invoke('digest:load', fingerprint),
+  saveDigest: (fingerprint: string, digest: object) => ipcRenderer.invoke('digest:save', fingerprint, digest),
+  deleteDigest: (fingerprint: string) => ipcRenderer.invoke('digest:delete', fingerprint),
 
   // Menu events from main process
   onPdfOpened: (cb: (data: { path: string; name: string; data: string }) => void) => {
@@ -39,5 +42,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onRedo: (cb: () => void) => {
     ipcRenderer.on('menu:redo', () => cb());
+  },
+  onCopySelection: (cb: () => void) => {
+    ipcRenderer.on('menu:copy-selection', () => cb());
+  },
+  onFind: (cb: () => void) => {
+    ipcRenderer.on('menu:find', () => cb());
   },
 });

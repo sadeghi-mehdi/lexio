@@ -30,7 +30,11 @@ export default function CommentModal({ text, initialComment = '', onSave, onCanc
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 animate-fade-in">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 animate-fade-in"
+      onMouseDown={(event) => event.stopPropagation()}
+      onMouseUp={(event) => event.stopPropagation()}
+    >
       <div
         className="bg-surface-2 rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
