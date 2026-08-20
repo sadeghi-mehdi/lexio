@@ -93,7 +93,7 @@ ASU Research Computing provides an OpenAI-compatible LLM gateway that can be use
 
 #### Create an ASU API key
 
-1. Sign in to the [ASU Research Computing Voyager portal](https://voyager.rc.asu.edu/profile?tab=llm-access) with your ASU account.
+1. Sign in to the [ASU Research Computing Voyager portal](https://voyager.rc.asu.edu/) with your ASU account.
 2. Open the **AI LLM** tab if the direct link does not select it automatically.
 3. In **LLM API Access**, confirm that the displayed endpoint is:
 
