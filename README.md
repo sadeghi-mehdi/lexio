@@ -104,7 +104,7 @@ ASU Research Computing provides an OpenAI-compatible LLM gateway that can be use
 4. Under **API keys**, click **Create Key**.
 5. Give the key a descriptive name, such as `Lexio`, and create it.
 6. Copy the complete key when it is shown and store it securely. The portal may show only a masked version afterward. If a key is lost or exposed, rotate or replace it in Voyager.
-7. Use the model catalog on the **AI LLM** page to copy the exact model ID available to your account. Availability can change, so use the ID shown in Voyager rather than a display name or an ID copied from an older guide.
+7. Use the model catalog on the **AI LLM** page to copy the exact model ID of your choice. Availability can change, so use the ID shown in Voyager rather than a display name or an ID copied from an older guide. A relatively small and fast model like `gemma4-31b-it` is preferred.
 
 > **Keep the key private.** Never put it in the Lexio source code, a `.env` file committed to Git, an issue, a screenshot, or a chat message. Lexio stores saved keys separately from ordinary settings using Electron's operating-system encryption.
 
@@ -116,7 +116,7 @@ ASU Research Computing provides an OpenAI-compatible LLM gateway that can be use
 4. Set **API base URL** to `https://openai.rc.asu.edu/v1`.
 5. Paste the ASU key into **API Key**.
 6. Enter the exact Voyager model ID in **Model**. Generic endpoints accept custom model IDs, so the value must match the catalog exactly.
-7. Optional: to use ASU for document indexing, select **Use Generic OpenAI-Compatible to build the reusable page index**. Leave the page-index model on the main model or enter another exact ASU model ID under **Custom model**.
+7. Leave the page-index model on the main model or enter another smaller/faster ASU model ID under **Custom model**.
 8. Click **Save**, open a PDF, and send a short test question.
 
 Common errors:
