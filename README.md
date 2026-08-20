@@ -75,17 +75,55 @@ Lexio embeds AI directly into the reading experience. Select text for a focused 
 
 ## AI Providers
 
-Lexio ships with four providers out of the box. Use one — or all of them.
+Lexio ships with five providers out of the box. Use one — or all of them.
 
 | Provider | Type | Default Model | Setup |
 |----------|------|---------------|-------|
 | **Ollama** | Local, free | `llama3.2` | Install [Ollama](https://ollama.com), run `ollama pull llama3.2` |
 | **Claude** | Cloud API | `claude-sonnet-4` | [Get API key](https://console.anthropic.com/settings/keys) |
 | **OpenAI** | Cloud API | `gpt-4o` | [Get API key](https://platform.openai.com/api-keys) |
-| **Generic OpenAI-Compatible** | Custom endpoint | Endpoint-specific | Configure an API base URL and exact model ID |
+| **Generic OpenAI-Compatible** | Custom endpoint | Endpoint-specific | Configure an API base URL and exact model ID; ASU users can follow the guide below |
 | **Gemini** | Cloud API | `gemini-2.0-flash` | [Get API key](https://aistudio.google.com/app/apikey) |
 
 > **Privacy first** — Ollama runs entirely on your machine. No data ever leaves your computer.
+
+### ASU Research Computing API Setup
+
+ASU Research Computing provides an OpenAI-compatible LLM gateway that can be used through Lexio's **Generic OpenAI-Compatible** provider. Access requires an eligible ASU Research Computing account and permission to use the AI LLM service.
+
+#### Create an ASU API key
+
+1. Sign in to the [ASU Research Computing Voyager portal](https://voyager.rc.asu.edu/profile?tab=llm-access) with your ASU account.
+2. Open the **AI LLM** tab if the direct link does not select it automatically.
+3. In **LLM API Access**, confirm that the displayed endpoint is:
+
+   ```text
+   https://openai.rc.asu.edu/v1
+   ```
+
+4. Under **API keys**, click **Create Key**.
+5. Give the key a descriptive name, such as `Lexio`, and create it.
+6. Copy the complete key when it is shown and store it securely. The portal may show only a masked version afterward. If a key is lost or exposed, rotate or replace it in Voyager.
+7. Use the model catalog on the **AI LLM** page to copy the exact model ID available to your account. Availability can change, so use the ID shown in Voyager rather than a display name or an ID copied from an older guide.
+
+> **Keep the key private.** Never put it in the Lexio source code, a `.env` file committed to Git, an issue, a screenshot, or a chat message. Lexio stores saved keys separately from ordinary settings using Electron's operating-system encryption.
+
+#### Connect Lexio to ASU
+
+1. Open Lexio and click the **Settings** icon in the top toolbar.
+2. Select **Generic OpenAI-Compatible** from the provider list.
+3. Turn **Enabled** on.
+4. Set **API base URL** to `https://openai.rc.asu.edu/v1`.
+5. Paste the ASU key into **API Key**.
+6. Enter the exact Voyager model ID in **Model**. Generic endpoints accept custom model IDs, so the value must match the catalog exactly.
+7. Optional: to use ASU for document indexing, select **Use Generic OpenAI-Compatible to build the reusable page index**. Leave the page-index model on the main model or enter another exact ASU model ID under **Custom model**.
+8. Click **Save**, open a PDF, and send a short test question.
+
+Common errors:
+
+- **`400 Invalid model name`** — the model ID is unavailable, misspelled, or not enabled for your key. Copy a currently available ID from Voyager.
+- **`401` or `403`** — verify the complete key, account access, and key status. Rotate the key if necessary.
+- **Connection or endpoint error** — confirm the base URL includes `/v1` and uses `https://`.
 
 ---
 
