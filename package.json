@@ -1,6 +1,6 @@
 {
   "name": "lexio",
-  "version": "1.6.0",
+  "version": "0.4.0",
   "description": "AI-native PDF reader with adaptive page-aware document context.",
   "author": "Nikodem Zymla; v1.x development by Mehdi Sadeghi",
   "repository": {

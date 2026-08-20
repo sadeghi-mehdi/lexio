@@ -226,9 +226,9 @@ Then register it in `DEFAULT_PROVIDERS` in `src/types.ts`.
 
 ## Change Catalog
 
-The entry matching the version in `package.json` is required. The automated test suite checks this, so every future version change must update this catalog before it can pass verification.
+Lexio follows [Semantic Versioning](https://semver.org/). While the application remains in active pre-1.0 development, backward-compatible feature milestones increment the minor version and bug fixes increment the patch version. Version `1.0.0` is reserved for the first stable release. The entry matching the version in `package.json` is required; the automated test suite checks this, so every future version change must update this catalog before it can pass verification.
 
-### v1.6.0 — Annotation and usability release
+### v0.4.0 — Annotation and usability release
 
 - Restored highlight, underline, strikethrough, and comment tools, including color selection and cross-page annotation creation.
 - Added visible comment editing and annotation removal controls with undo/redo support.
@@ -245,7 +245,7 @@ The entry matching the version in `package.json` is required. The automated test
 - Added a real enable/disable switch for Ollama and enforced disabled-provider status for chat and page indexing.
 - Restricted `gemma4-e2b-it` to the Generic OpenAI-Compatible provider while preserving preset and custom model selection elsewhere.
 
-### v1.5.0 — Multi-document workspace
+### v0.3.0 — Multi-document workspace
 
 - Added multiple PDF tabs with open, switch, close, and duplicate-document focusing behavior.
 - Isolated viewer position, zoom, extracted text, annotations, chats, streaming state, and page indexes by document.
@@ -254,7 +254,7 @@ The entry matching the version in `package.json` is required. The automated test
 - Displayed the exact provider and model used for AI responses.
 - Added PDF-tab keyboard shortcuts and preserved extracted document state when revisiting a tab.
 
-### v1.0.0 — Page-aware AI architecture
+### v0.2.0 — Page-aware AI architecture
 
 - Replaced the modified OpenAI configuration with the original OpenAI provider and added a separate Generic OpenAI-Compatible provider, defaulting to ASU Research Computing's endpoint.
 - Added configurable context limits, custom instructions, document-aware retrieval, reusable per-page indexes, and hierarchical whole-document summarization.
