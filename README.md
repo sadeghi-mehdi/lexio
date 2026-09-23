@@ -222,7 +222,9 @@ lexio/
 │   ├── stores/
 │   │   └── useStore.ts      # Zustand state (PDF, annotations, AI, UI)
 │   ├── utils/
-│   │   └── pdf-save.ts      # PDF annotation export
+│   │   ├── pdf-save.ts      # PDF annotation export, open/save helpers
+│   │   ├── pdfjs.ts         # Local PDF.js worker, cMaps and fonts
+│   │   └── pdf-document-registry.ts # One parsed PDF per tab
 │   └── types.ts
 ├── vite.config.ts
 └── package.json
@@ -265,6 +267,31 @@ Then register it in `DEFAULT_PROVIDERS` in `src/types.ts`.
 ## Change Catalog
 
 Lexio follows [Semantic Versioning](https://semver.org/). While the application remains in active pre-1.0 development, backward-compatible feature milestones increment the minor version and bug fixes increment the patch version. Version `1.0.0` is reserved for the first stable release. The entry matching the version in `package.json` is required; the automated test suite checks this, so every future version change must update this catalog before it can pass verification.
+
+### Unreleased: Security and performance hardening
+
+Security:
+- The renderer can no longer read or write arbitrary files. The unused `readFile` bridge is gone, and in-place saves only work for files the user opened through the dialog or a real drag and drop. The main process tracks them by opaque id.
+- Enabled the Electron sandbox. External links open in the system browser, navigation away from the app is blocked, and unneeded permission requests are refused.
+- The PDF.js worker, character maps, standard fonts and UI fonts ship with the app. Nothing loads from a CDN, PDFs open offline, and built pages carry a Content-Security-Policy that blocks inline and remote scripts. PDF.js font `eval` is disabled.
+- Building the page index with a cloud provider now asks before sending the document text. A Settings option restores automatic indexing.
+- The Generic OpenAI-Compatible provider no longer defaults to a third-party host, and it accepts plain `http://` only for localhost. Existing ASU configurations keep their endpoint.
+- The Gemini API key is sent in a header instead of the URL.
+- Settings warns when API keys cannot be saved securely (no OS keychain, or Linux `basic_text` storage).
+- Developer tools are hidden in packaged builds.
+- Save PDF always redraws from the originally opened bytes, so repeated saves no longer stack highlights.
+
+Performance:
+- Components subscribe to the specific store fields they render, instead of re-rendering on every store change.
+- Streamed answers update the UI at most once per frame, and chat bubbles are memoized.
+- Pages far from the viewport release their canvases, and thumbnails reuse the viewer's parsed document and render only when visible.
+- PDFs show their first page before every page size is known. Text extraction commits in batches and fetches each page's text once.
+- PDFs travel as bytes instead of base64, are hashed once in the main process, and stay parsed across tab switches. An interrupted page index resumes where it stopped.
+- Ctrl+wheel zoom previews with a CSS transform and re-renders once. Page tracking and drag selection no longer measure every page.
+- Find waits for typing to pause and moves the active match without rebuilding overlays.
+- Faster JSON repair for page-index responses, and async file I/O in the main process.
+- Fixed Ollama streams dropping tokens split across network chunks.
+- Pages wider than the viewer now scroll horizontally instead of being cut off on the left.
 
 ### v0.4.0 — Annotation and usability release
 

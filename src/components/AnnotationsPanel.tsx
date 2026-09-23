@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { MessageSquare, FileText, Highlighter, Underline, Strikethrough, Pencil, Trash2 } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
 import type { Highlight, HighlightColor, AnnotationType } from '../types';
 import CommentModal from './CommentModal';
@@ -19,7 +20,12 @@ const TYPE_ICONS: Record<AnnotationType, React.ReactNode> = {
 };
 
 export default function AnnotationsPanel() {
-  const { highlights, removeHighlight, updateHighlightComment, setCurrentPage } = useStore();
+  const { highlights, removeHighlight, updateHighlightComment, setCurrentPage } = useStore(useShallow((state) => ({
+    highlights: state.highlights,
+    removeHighlight: state.removeHighlight,
+    updateHighlightComment: state.updateHighlightComment,
+    setCurrentPage: state.setCurrentPage,
+  })));
   const [editingHighlight, setEditingHighlight] = useState<Highlight | null>(null);
 
   const sorted = [...highlights].sort((a, b) => {

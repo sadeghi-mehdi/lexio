@@ -71,6 +71,9 @@ export function normalizeSettings(raw: unknown): AppSettings {
     providers.openaiCompatible = {
       ...cloneProvider(DEFAULT_PROVIDERS.openaiCompatible),
       enabled: typeof rawOpenAI.enabled === 'boolean' ? rawOpenAI.enabled : false,
+      // The generic provider no longer defaults to any host. Keep the ASU
+      // endpoint only for users who were already configured for it.
+      baseUrl: legacyOpenAIBaseUrl || 'https://openai.rc.asu.edu/v1',
       apiKey: typeof rawOpenAI.apiKey === 'string' ? rawOpenAI.apiKey : '',
       model:
         typeof rawOpenAI.model === 'string'
@@ -147,6 +150,10 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof source.digestEnabled === 'boolean'
         ? source.digestEnabled
         : DEFAULT_SETTINGS.digestEnabled,
+    digestAutoCloud:
+      typeof source.digestAutoCloud === 'boolean'
+        ? source.digestAutoCloud
+        : DEFAULT_SETTINGS.digestAutoCloud,
     digestProvider: rawDigestProvider,
     digestModels,
     digestChunkChars: clampInteger(

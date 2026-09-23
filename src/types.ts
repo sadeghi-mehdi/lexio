@@ -1,28 +1,31 @@
 // ─── Electron Bridge ───
 
+type Unsubscribe = () => void;
+
 interface ElectronAPI {
   openPdf: () => Promise<void>;
-  readFile: (path: string) => Promise<string>;
+  openDroppedPdf: (file: File) => Promise<PdfFileData | null>;
   saveFile: (name: string, content: string) => Promise<string | null>;
-  savePdf: (name: string, base64Data: string) => Promise<string | null>;
-  savePdfInPlace: (path: string, base64Data: string) => Promise<boolean>;
+  savePdf: (name: string, data: Uint8Array) => Promise<string | null>;
+  savePdfInPlace: (fileId: string, data: Uint8Array) => Promise<boolean>;
   loadSettings: () => Promise<unknown>;
   saveSettings: (settings: AppSettings) => Promise<void>;
+  credentialStatus: () => Promise<{ persistent: boolean; weak: boolean }>;
   loadDigest: (fingerprint: string) => Promise<unknown>;
   saveDigest: (fingerprint: string, digest: DocumentDigest) => Promise<void>;
   deleteDigest: (fingerprint: string) => Promise<void>;
-  onPdfOpened: (cb: (data: PdfFileData) => void) => void;
-  onToggleSidebar: (cb: () => void) => void;
-  onZoomIn: (cb: () => void) => void;
-  onZoomOut: (cb: () => void) => void;
-  onZoomReset: (cb: () => void) => void;
-  onExportAnnotations: (cb: () => void) => void;
-  onSavePdf: (cb: () => void) => void;
-  onSavePdfAs: (cb: () => void) => void;
-  onUndo: (cb: () => void) => void;
-  onRedo: (cb: () => void) => void;
-  onCopySelection: (cb: () => void) => void;
-  onFind: (cb: () => void) => void;
+  onPdfOpened: (cb: (data: PdfFileData) => void) => Unsubscribe;
+  onToggleSidebar: (cb: () => void) => Unsubscribe;
+  onZoomIn: (cb: () => void) => Unsubscribe;
+  onZoomOut: (cb: () => void) => Unsubscribe;
+  onZoomReset: (cb: () => void) => Unsubscribe;
+  onExportAnnotations: (cb: () => void) => Unsubscribe;
+  onSavePdf: (cb: () => void) => Unsubscribe;
+  onSavePdfAs: (cb: () => void) => Unsubscribe;
+  onUndo: (cb: () => void) => Unsubscribe;
+  onRedo: (cb: () => void) => Unsubscribe;
+  onCopySelection: (cb: () => void) => Unsubscribe;
+  onFind: (cb: () => void) => Unsubscribe;
 }
 
 declare global {
@@ -34,9 +37,15 @@ declare global {
 // ─── PDF ───
 
 export interface PdfFileData {
-  path: string;
+  // Opaque id issued by the main process (or name and size in browser mode).
+  // The renderer never sees a writable file path.
+  id: string;
   name: string;
-  data: string; // base64
+  data: Uint8Array<ArrayBuffer>;
+  // SHA-256 of the file bytes, computed once when the file is opened.
+  fingerprint?: string;
+  // True only for files the main process granted for in-place saving.
+  canSaveInPlace?: boolean;
 }
 
 // ─── Annotations ───
@@ -158,7 +167,8 @@ export type DigestStatus =
   | 'consolidating'
   | 'ready'
   | 'error'
-  | 'cancelled';
+  | 'cancelled'
+  | 'needs-approval';
 
 // ─── Settings ───
 
@@ -172,6 +182,9 @@ export interface AppSettings {
   maxContextChars: number;
   customInstructions: string;
   digestEnabled: boolean;
+  // When false, building the page index with a cloud provider waits for the
+  // user to approve sending the document text.
+  digestAutoCloud: boolean;
   digestProvider: 'active' | AIProvider;
   digestModels: Record<AIProvider, string>;
   digestChunkChars: number;
@@ -208,7 +221,7 @@ export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
     name: 'Generic OpenAI-Compatible',
     enabled: false,
     apiKey: '',
-    baseUrl: 'https://openai.rc.asu.edu/v1',
+    baseUrl: '',
     model: 'qwen3-235b-a22b-thinking-2507',
     models: [],
   },
@@ -232,6 +245,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxContextChars: 100000,
   customInstructions: '',
   digestEnabled: true,
+  digestAutoCloud: false,
   digestProvider: 'active',
   digestModels: {
     ollama: '',

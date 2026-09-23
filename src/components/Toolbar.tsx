@@ -16,7 +16,8 @@ import {
   Underline,
   Strikethrough,
 } from 'lucide-react';
-import { savePdfWithAnnotations } from '../utils/pdf-save';
+import { useShallow } from 'zustand/react/shallow';
+import { readPdfFile, savePdfCopy } from '../utils/pdf-save';
 import { useStore, type ToolType } from '../stores/useStore';
 import type { HighlightColor } from '../types';
 import logoSvg from '../assets/logo.svg';
@@ -33,7 +34,7 @@ const COLOR_TOOLS: ToolType[] = ['highlight', 'underline', 'strikeout'];
 
 export default function Toolbar() {
   const {
-    pdfFile,
+    hasPdf,
     currentPage,
     numPages,
     zoom,
@@ -41,7 +42,6 @@ export default function Toolbar() {
     activeHighlightColor,
     sidebarOpen,
     thumbnailSidebarOpen,
-    highlights,
     setCurrentPage,
     zoomIn,
     zoomOut,
@@ -51,36 +51,31 @@ export default function Toolbar() {
     toggleSidebar,
     toggleThumbnailSidebar,
     setSettingsOpen,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+    hasPdf: Boolean(state.pdfFile),
+    currentPage: state.currentPage,
+    numPages: state.numPages,
+    zoom: state.zoom,
+    activeTool: state.activeTool,
+    activeHighlightColor: state.activeHighlightColor,
+    sidebarOpen: state.sidebarOpen,
+    thumbnailSidebarOpen: state.thumbnailSidebarOpen,
+    setCurrentPage: state.setCurrentPage,
+    zoomIn: state.zoomIn,
+    zoomOut: state.zoomOut,
+    zoomReset: state.zoomReset,
+    setActiveTool: state.setActiveTool,
+    setActiveHighlightColor: state.setActiveHighlightColor,
+    toggleSidebar: state.toggleSidebar,
+    toggleThumbnailSidebar: state.toggleThumbnailSidebar,
+    setSettingsOpen: state.setSettingsOpen,
+  })));
 
   const handleSave = async () => {
+    const { pdfFile, highlights } = useStore.getState();
     if (!pdfFile) return;
-
     try {
-      const modifiedPdf = await savePdfWithAnnotations(pdfFile.data, highlights);
-
-      if (window.electronAPI) {
-        // In Electron: save to file
-        const savedPath = await window.electronAPI.savePdf(
-          pdfFile.name.replace('.pdf', '-annotated.pdf'),
-          modifiedPdf
-        );
-        if (savedPath) {
-          console.log('PDF saved to:', savedPath);
-        }
-      } else {
-        // In browser: download
-        const blob = new Blob(
-          [Uint8Array.from(atob(modifiedPdf), (c) => c.charCodeAt(0))],
-          { type: 'application/pdf' }
-        );
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = pdfFile.name.replace('.pdf', '-annotated.pdf');
-        a.click();
-        URL.revokeObjectURL(url);
-      }
+      await savePdfCopy(pdfFile, highlights);
     } catch (err) {
       console.error('Failed to save PDF:', err);
     }
@@ -89,27 +84,17 @@ export default function Toolbar() {
   const openFile = () => {
     if (window.electronAPI) {
       window.electronAPI.openPdf();
-    } else {
-      // Fallback: file input for web/dev mode
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.pdf';
-      input.onchange = (e) => {
-        const file = (e.target as HTMLInputElement).files?.[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          useStore.getState().setPdfFile({
-            path: file.name,
-            name: file.name,
-            data: base64,
-          });
-        };
-        reader.readAsDataURL(file);
-      };
-      input.click();
+      return;
     }
+    // Fallback: file input for web/dev mode
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.pdf';
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) useStore.getState().setPdfFile(await readPdfFile(file));
+    };
+    input.click();
   };
 
   return (
@@ -122,7 +107,7 @@ export default function Toolbar() {
 
       {/* File */}
       <ToolbarButton icon={<FolderOpen size={16} />} label="Open PDF" onClick={openFile} />
-      {pdfFile && (
+      {hasPdf && (
         <ToolbarButton
           icon={<Save size={16} />}
           label="Save PDF with annotations"
@@ -131,7 +116,7 @@ export default function Toolbar() {
       )}
 
       {/* Thumbnail sidebar toggle */}
-      {pdfFile && (
+      {hasPdf && (
         <ToolbarButton
           icon={thumbnailSidebarOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
           label="Toggle page thumbnails"
@@ -139,7 +124,7 @@ export default function Toolbar() {
         />
       )}
 
-      {pdfFile && (
+      {hasPdf && (
         <>
           <Divider />
 

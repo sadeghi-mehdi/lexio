@@ -85,3 +85,10 @@ test('page-index models are provider-specific and reject a generic-only legacy o
   assert.equal(settings.digestModels.claude, 'claude-haiku-4-20250414');
   assert.equal(settings.digestModels.openaiCompatible, 'gemma4-e2b-it');
 });
+
+test('cloud page indexing asks first and the generic endpoint has no default host', () => {
+  const settings = normalizeSettings({});
+  assert.equal(settings.digestAutoCloud, false);
+  assert.equal(settings.providers.openaiCompatible.baseUrl, '');
+  assert.equal(normalizeSettings({ digestAutoCloud: true }).digestAutoCloud, true);
+});

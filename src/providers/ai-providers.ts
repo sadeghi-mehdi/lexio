@@ -44,13 +44,18 @@ const ollamaProvider: AIProviderInterface = {
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value, { stream: true });
-      for (const line of chunk.split('\n')) {
+      // A JSON line can be split across network chunks. Keep the unfinished
+      // tail in the buffer until its newline arrives.
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
         if (!line.trim()) continue;
         try {
           const json = JSON.parse(line);
@@ -58,6 +63,12 @@ const ollamaProvider: AIProviderInterface = {
           if (json.done) cb.onDone();
         } catch {}
       }
+    }
+    if (buffer.trim()) {
+      try {
+        const json = JSON.parse(buffer);
+        if (json.message?.content) cb.onToken(json.message.content);
+      } catch {}
     }
     cb.onDone();
   },
@@ -129,10 +140,34 @@ const claudeProvider: AIProviderInterface = {
 
 // ─── OpenAI-compatible APIs ───
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+
+export function isLoopbackUrl(url: string): boolean {
+  try {
+    return LOOPBACK_HOSTS.has(new URL(url).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// Local providers keep document text on this machine (or the user's own
+// Ollama server). Everything else is treated as a cloud upload.
+export function isLocalProvider(config: ProviderConfig): boolean {
+  return config.id === 'ollama' || (config.id === 'openaiCompatible' && isLoopbackUrl(config.baseUrl || ''));
+}
+
 export function buildOpenAICompatibleUrl(baseUrl: string): string {
   const normalized = baseUrl.trim().replace(/\/+$/, '');
+  if (!normalized) {
+    throw new Error('Enter the API base URL in Settings.');
+  }
   if (!/^https?:\/\//i.test(normalized)) {
     throw new Error('The API base URL must start with http:// or https://');
+  }
+  // Plain http would send the API key and the document text unencrypted.
+  // It is only allowed for a server on this machine.
+  if (/^http:\/\//i.test(normalized) && !isLoopbackUrl(normalized)) {
+    throw new Error('Use https:// for remote API servers. Plain http:// is only allowed for localhost.');
   }
   return normalized.endsWith('/chat/completions')
     ? normalized
@@ -215,7 +250,7 @@ const openaiProvider = createOpenAICompatibleProvider(
 );
 
 const genericOpenAIProvider = createOpenAICompatibleProvider(
-  'https://openai.rc.asu.edu/v1',
+  '',
   'OpenAI-compatible API',
   true
 );
@@ -224,7 +259,9 @@ const genericOpenAIProvider = createOpenAICompatibleProvider(
 
 const geminiProvider: AIProviderInterface = {
   async chat(messages, systemPrompt, config, signal, cb) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:streamGenerateContent?alt=sse&key=${config.apiKey}`;
+    // The key goes in a header, not the URL, so it never lands in logs or
+    // error messages that echo the request URL.
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:streamGenerateContent?alt=sse`;
 
     const contents = messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
@@ -238,7 +275,10 @@ const geminiProvider: AIProviderInterface = {
 
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': config.apiKey || '',
+      },
       body: JSON.stringify(body),
       signal,
     });

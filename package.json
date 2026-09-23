@@ -20,6 +20,8 @@
     "package:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
+    "@fontsource-variable/dm-sans": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
     "lucide-react": "^0.468.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.9.155",

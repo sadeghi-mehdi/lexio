@@ -1,5 +1,5 @@
-import { PDFDocument, rgb, PDFPage } from 'pdf-lib';
-import type { Highlight, HighlightColor } from '../types';
+import { PDFDocument, rgb } from 'pdf-lib';
+import type { Highlight, HighlightColor, PdfFileData } from '../types';
 
 // Color mapping for PDF annotations
 const PDF_COLORS: Record<HighlightColor, { r: number; g: number; b: number }> = {
@@ -10,13 +10,14 @@ const PDF_COLORS: Record<HighlightColor, { r: number; g: number; b: number }> = 
   orange: { r: 1, g: 0.6, b: 0 },
 };
 
+// Always called with the bytes the document was opened with. The store never
+// replaces them with a saved copy, so saving twice does not draw the same
+// highlights twice, and deleted highlights disappear from the next save.
 export async function savePdfWithAnnotations(
-  originalBase64: string,
+  originalBytes: Uint8Array<ArrayBuffer>,
   highlights: Highlight[]
-): Promise<string> {
-  // Load the original PDF
-  const pdfBytes = Uint8Array.from(atob(originalBase64), (c) => c.charCodeAt(0));
-  const pdfDoc = await PDFDocument.load(pdfBytes);
+): Promise<Uint8Array<ArrayBuffer>> {
+  const pdfDoc = await PDFDocument.load(originalBytes);
   const pages = pdfDoc.getPages();
 
   // Group highlights by page
@@ -95,33 +96,38 @@ export async function savePdfWithAnnotations(
     }
   }
 
-  // Save and return as base64
-  const modifiedPdfBytes = await pdfDoc.save();
-  const base64 = btoa(
-    Array.from(modifiedPdfBytes)
-      .map((b) => String.fromCharCode(b))
-      .join('')
-  );
-
-  return base64;
+  return (await pdfDoc.save()) as Uint8Array<ArrayBuffer>;
 }
 
-// Export annotations as JSON for backup
-export function exportAnnotationsAsJson(
-  fileName: string,
-  highlights: Highlight[]
-): string {
-  const exportData = {
-    file: fileName,
-    exportedAt: new Date().toISOString(),
-    annotations: highlights.map((h) => ({
-      page: h.page,
-      type: h.type,
-      text: h.text,
-      color: h.color,
-      comment: h.comment,
-      createdAt: new Date(h.createdAt).toISOString(),
-    })),
+export function annotatedFileName(name: string): string {
+  return /\.pdf$/i.test(name) ? name.replace(/\.pdf$/i, '-annotated.pdf') : `${name}-annotated.pdf`;
+}
+
+// Save As: a native dialog in Electron, a download in browser mode.
+export async function savePdfCopy(pdfFile: PdfFileData, highlights: Highlight[]): Promise<void> {
+  const bytes = await savePdfWithAnnotations(pdfFile.data, highlights);
+  if (window.electronAPI) {
+    await window.electronAPI.savePdf(annotatedFileName(pdfFile.name), bytes);
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = annotatedFileName(pdfFile.name);
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Browser-mode fallback for opening a File (file picker or a drop without a
+// filesystem path). Such files cannot be saved in place.
+export async function readPdfFile(file: File): Promise<PdfFileData> {
+  const data = new Uint8Array(await file.arrayBuffer());
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return {
+    id: `${file.name}::${file.size}::${file.lastModified}`,
+    name: file.name,
+    data,
+    fingerprint: [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join(''),
+    canSaveInPlace: false,
   };
-  return JSON.stringify(exportData, null, 2);
 }

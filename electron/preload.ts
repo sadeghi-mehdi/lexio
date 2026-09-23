@@ -1,52 +1,41 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
+
+// Each on* subscription returns an unsubscribe function so React effects can
+// clean up (StrictMode mounts effects twice in development).
+const subscribe = (channel: string) => (cb: (...args: any[]) => void) => {
+  const listener = (_event: IpcRendererEvent, ...args: any[]) => cb(...args);
+  ipcRenderer.on(channel, listener);
+  return () => { ipcRenderer.removeListener(channel, listener); };
+};
 
 contextBridge.exposeInMainWorld('electronAPI', {
   openPdf: () => ipcRenderer.invoke('dialog:open-pdf'),
-  readFile: (path: string) => ipcRenderer.invoke('fs:read-file', path),
+  // Only a real dropped File has a path. Page script cannot forge one.
+  openDroppedPdf: (file: File) => {
+    const filePath = webUtils.getPathForFile(file);
+    return filePath ? ipcRenderer.invoke('pdf:open-dropped', filePath) : Promise.resolve(null);
+  },
   saveFile: (name: string, content: string) => ipcRenderer.invoke('dialog:save-file', name, content),
-  savePdf: (name: string, base64Data: string) => ipcRenderer.invoke('dialog:save-pdf', name, base64Data),
-  savePdfInPlace: (path: string, base64Data: string) => ipcRenderer.invoke('fs:save-pdf-inplace', path, base64Data),
+  savePdf: (name: string, data: Uint8Array) => ipcRenderer.invoke('dialog:save-pdf', name, data),
+  savePdfInPlace: (fileId: string, data: Uint8Array) => ipcRenderer.invoke('fs:save-pdf-inplace', fileId, data),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings: object) => ipcRenderer.invoke('settings:save', settings),
+  credentialStatus: () => ipcRenderer.invoke('settings:credential-status'),
   loadDigest: (fingerprint: string) => ipcRenderer.invoke('digest:load', fingerprint),
   saveDigest: (fingerprint: string, digest: object) => ipcRenderer.invoke('digest:save', fingerprint, digest),
   deleteDigest: (fingerprint: string) => ipcRenderer.invoke('digest:delete', fingerprint),
 
   // Menu events from main process
-  onPdfOpened: (cb: (data: { path: string; name: string; data: string }) => void) => {
-    ipcRenderer.on('pdf:opened', (_e, data) => cb(data));
-  },
-  onToggleSidebar: (cb: () => void) => {
-    ipcRenderer.on('menu:toggle-sidebar', () => cb());
-  },
-  onZoomIn: (cb: () => void) => {
-    ipcRenderer.on('menu:zoom-in', () => cb());
-  },
-  onZoomOut: (cb: () => void) => {
-    ipcRenderer.on('menu:zoom-out', () => cb());
-  },
-  onZoomReset: (cb: () => void) => {
-    ipcRenderer.on('menu:zoom-reset', () => cb());
-  },
-  onExportAnnotations: (cb: () => void) => {
-    ipcRenderer.on('menu:export-annotations', () => cb());
-  },
-  onSavePdf: (cb: () => void) => {
-    ipcRenderer.on('menu:save-pdf', () => cb());
-  },
-  onSavePdfAs: (cb: () => void) => {
-    ipcRenderer.on('menu:save-pdf-as', () => cb());
-  },
-  onUndo: (cb: () => void) => {
-    ipcRenderer.on('menu:undo', () => cb());
-  },
-  onRedo: (cb: () => void) => {
-    ipcRenderer.on('menu:redo', () => cb());
-  },
-  onCopySelection: (cb: () => void) => {
-    ipcRenderer.on('menu:copy-selection', () => cb());
-  },
-  onFind: (cb: () => void) => {
-    ipcRenderer.on('menu:find', () => cb());
-  },
+  onPdfOpened: subscribe('pdf:opened'),
+  onToggleSidebar: subscribe('menu:toggle-sidebar'),
+  onZoomIn: subscribe('menu:zoom-in'),
+  onZoomOut: subscribe('menu:zoom-out'),
+  onZoomReset: subscribe('menu:zoom-reset'),
+  onExportAnnotations: subscribe('menu:export-annotations'),
+  onSavePdf: subscribe('menu:save-pdf'),
+  onSavePdfAs: subscribe('menu:save-pdf-as'),
+  onUndo: subscribe('menu:undo'),
+  onRedo: subscribe('menu:redo'),
+  onCopySelection: subscribe('menu:copy-selection'),
+  onFind: subscribe('menu:find'),
 });

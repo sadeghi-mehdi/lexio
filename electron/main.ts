@@ -1,12 +1,21 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu, safeStorage, session, shell } from 'electron';
 import * as path from 'path';
-import * as fs from 'fs';
+import { promises as fs } from 'fs';
+import { createHash, randomUUID } from 'crypto';
 import { mergeSettingsApiKeys, splitSettingsApiKeys } from './credential-settings';
 
 let mainWindow: BrowserWindow | null = null;
 
 const DIST = path.join(__dirname, '../dist');
 const PRELOAD = path.join(__dirname, 'preload.js');
+const MAX_DIGEST_BYTES = 20 * 1024 * 1024;
+
+// The renderer never receives a writable path. Every PDF the user opens through
+// the dialog or a real drag-and-drop gets an opaque id, and in-place saves are
+// only allowed for ids in this map. A compromised renderer can therefore not
+// read or overwrite arbitrary files.
+const grantedFiles = new Map<string, string>();
+const fileIdsByPath = new Map<string, string>();
 
 function createWindow() {
   const windowIcon = app.isPackaged
@@ -25,7 +34,7 @@ function createWindow() {
       preload: PRELOAD,
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
     show: false,
   });
@@ -51,7 +60,7 @@ function buildMenu() {
         {
           label: 'Open PDF…',
           accelerator: 'CmdOrCtrl+O',
-          click: () => handleOpenPdf(),
+          click: () => { void handleOpenPdf(); },
         },
         { type: 'separator' },
         {
@@ -129,7 +138,8 @@ function buildMenu() {
           click: () => mainWindow?.webContents.send('menu:zoom-reset'),
         },
         { type: 'separator' },
-        { role: 'toggleDevTools' },
+        // Developer tools stay out of packaged builds.
+        ...(app.isPackaged ? [] : [{ role: 'toggleDevTools' } as Electron.MenuItemConstructorOptions]),
         { role: 'togglefullscreen' },
       ],
     },
@@ -152,6 +162,33 @@ function buildMenu() {
   Menu.setApplicationMenu(menu);
 }
 
+async function readGrantedPdf(filePath: string) {
+  const resolved = path.resolve(filePath);
+  if (path.extname(resolved).toLowerCase() !== '.pdf') throw new Error('Only PDF files can be opened.');
+  const stat = await fs.stat(resolved);
+  if (!stat.isFile()) throw new Error('The selected path is not a file.');
+  const buffer = await fs.readFile(resolved);
+
+  // Windows and macOS file systems are case-insensitive by default, so the same
+  // file opened with different casing keeps one id and one tab.
+  const key = process.platform === 'linux' ? resolved : resolved.toLowerCase();
+  let id = fileIdsByPath.get(key);
+  if (!id) {
+    id = randomUUID();
+    fileIdsByPath.set(key, id);
+    grantedFiles.set(id, resolved);
+  }
+  return {
+    id,
+    name: path.basename(resolved),
+    // Copy into a standalone buffer: a view over Node's shared pool would
+    // serialize the whole pool across IPC.
+    data: new Uint8Array(buffer),
+    fingerprint: createHash('sha256').update(buffer).digest('hex'),
+    canSaveInPlace: true,
+  };
+}
+
 async function handleOpenPdf() {
   if (!mainWindow) return;
 
@@ -161,15 +198,22 @@ async function handleOpenPdf() {
   });
 
   if (!result.canceled && result.filePaths.length > 0) {
-    const filePath = result.filePaths[0];
-    const buffer = fs.readFileSync(filePath);
-    const data = buffer.toString('base64');
-    mainWindow.webContents.send('pdf:opened', {
-      path: filePath,
-      name: path.basename(filePath),
-      data,
-    });
+    try {
+      mainWindow.webContents.send('pdf:opened', await readGrantedPdf(result.filePaths[0]));
+    } catch (error: any) {
+      dialog.showErrorBox('Could not open PDF', error?.message || String(error));
+    }
   }
+}
+
+function safeDefaultName(name: unknown, fallback: string): string {
+  return typeof name === 'string' && name.trim() ? path.basename(name) : fallback;
+}
+
+async function writeAtomically(target: string, data: string | Uint8Array): Promise<void> {
+  const temporary = `${target}.${process.pid}.tmp`;
+  await fs.writeFile(temporary, data);
+  await fs.rename(temporary, target);
 }
 
 // ─── IPC Handlers ───
@@ -178,45 +222,47 @@ ipcMain.handle('dialog:open-pdf', async () => {
   await handleOpenPdf();
 });
 
-ipcMain.handle('fs:read-file', async (_event, filePath: string) => {
-  const buffer = fs.readFileSync(filePath);
-  return buffer.toString('base64');
+// The preload resolves a dropped File to its path with webUtils. A synthetic
+// File built by page script has no path, so only real drops reach this handler.
+ipcMain.handle('pdf:open-dropped', async (_event, filePath: unknown) => {
+  if (typeof filePath !== 'string' || !filePath) return null;
+  return readGrantedPdf(filePath);
 });
 
-ipcMain.handle('dialog:save-file', async (_event, defaultName: string, content: string) => {
-  if (!mainWindow) return null;
+ipcMain.handle('dialog:save-file', async (_event, defaultName: unknown, content: unknown) => {
+  if (!mainWindow || typeof content !== 'string') return null;
   const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: defaultName,
+    defaultPath: safeDefaultName(defaultName, 'annotations.json'),
     filters: [
       { name: 'JSON', extensions: ['json'] },
       { name: 'Markdown', extensions: ['md'] },
     ],
   });
   if (!result.canceled && result.filePath) {
-    fs.writeFileSync(result.filePath, content, 'utf-8');
+    await fs.writeFile(result.filePath, content, 'utf-8');
     return result.filePath;
   }
   return null;
 });
 
-ipcMain.handle('dialog:save-pdf', async (_event, defaultName: string, base64Data: string) => {
-  if (!mainWindow) return null;
+ipcMain.handle('dialog:save-pdf', async (_event, defaultName: unknown, data: unknown) => {
+  if (!mainWindow || !(data instanceof Uint8Array)) return null;
   const result = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: defaultName,
+    defaultPath: safeDefaultName(defaultName, 'document.pdf'),
     filters: [{ name: 'PDF Files', extensions: ['pdf'] }],
   });
   if (!result.canceled && result.filePath) {
-    const buffer = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(result.filePath, buffer);
+    await writeAtomically(result.filePath, data);
     return result.filePath;
   }
   return null;
 });
 
-ipcMain.handle('fs:save-pdf-inplace', async (_event, filePath: string, base64Data: string) => {
+ipcMain.handle('fs:save-pdf-inplace', async (_event, fileId: unknown, data: unknown) => {
+  const target = typeof fileId === 'string' ? grantedFiles.get(fileId) : undefined;
+  if (!target || !(data instanceof Uint8Array)) return false;
   try {
-    const buffer = Buffer.from(base64Data, 'base64');
-    fs.writeFileSync(filePath, buffer);
+    await writeAtomically(target, data);
     return true;
   } catch {
     return false;
@@ -259,10 +305,19 @@ function credentialsPath(): string {
   return path.join(app.getPath('userData'), 'credentials.json');
 }
 
-function loadEncryptedApiKeys(): Record<string, string> {
+// On Linux without a keyring, Electron falls back to the "basic_text" backend,
+// which encrypts with a hardcoded password. Keys are still saved, but the
+// Settings panel warns the user that they are not really protected.
+function credentialStatus(): { persistent: boolean; weak: boolean } {
+  const persistent = safeStorage.isEncryptionAvailable();
+  const backend = process.platform === 'linux' ? safeStorage.getSelectedStorageBackend() : '';
+  return { persistent, weak: persistent && backend === 'basic_text' };
+}
+
+async function loadEncryptedApiKeys(): Promise<Record<string, string>> {
   if (!safeStorage.isEncryptionAvailable()) return {};
   try {
-    const stored = JSON.parse(fs.readFileSync(credentialsPath(), 'utf-8')) as {
+    const stored = JSON.parse(await fs.readFile(credentialsPath(), 'utf-8')) as {
       version?: number;
       keys?: Record<string, string>;
     };
@@ -280,10 +335,10 @@ function loadEncryptedApiKeys(): Record<string, string> {
   }
 }
 
-function saveEncryptedApiKeys(apiKeys: Readonly<Record<string, string>>): void {
+async function saveEncryptedApiKeys(apiKeys: Readonly<Record<string, string>>): Promise<void> {
   const nonEmptyKeys = Object.fromEntries(Object.entries(apiKeys).filter(([, value]) => value));
   if (Object.keys(nonEmptyKeys).length === 0) {
-    try { fs.unlinkSync(credentialsPath()); } catch {}
+    await fs.unlink(credentialsPath()).catch(() => {});
     return;
   }
   if (!safeStorage.isEncryptionAvailable()) return;
@@ -291,66 +346,86 @@ function saveEncryptedApiKeys(apiKeys: Readonly<Record<string, string>>): void {
     providerId,
     safeStorage.encryptString(apiKey).toString('base64'),
   ]));
-  const target = credentialsPath();
-  const temporary = `${target}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify({ version: 1, keys: encrypted }, null, 2), 'utf-8');
-  fs.renameSync(temporary, target);
+  await writeAtomically(credentialsPath(), JSON.stringify({ version: 1, keys: encrypted }, null, 2));
 }
 
 ipcMain.handle('settings:load', async () => {
   let settings: unknown = null;
   try {
-    settings = JSON.parse(fs.readFileSync(settingsPath(), 'utf-8'));
+    settings = JSON.parse(await fs.readFile(settingsPath(), 'utf-8'));
   } catch {}
-  const apiKeys = loadEncryptedApiKeys();
+  const apiKeys = await loadEncryptedApiKeys();
   if (!settings && Object.keys(apiKeys).length === 0) return null;
   return mergeSettingsApiKeys(settings, apiKeys);
 });
 
 ipcMain.handle('settings:save', async (_event, settings: unknown) => {
   const separated = splitSettingsApiKeys(settings);
-  saveEncryptedApiKeys(separated.apiKeys);
-  const target = settingsPath();
-  const temporary = `${target}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(separated.settings, null, 2), 'utf-8');
-  fs.renameSync(temporary, target);
+  await saveEncryptedApiKeys(separated.apiKeys);
+  await writeAtomically(settingsPath(), JSON.stringify(separated.settings, null, 2));
 });
 
-function digestPath(fingerprint: string): string {
-  if (!/^[a-f0-9]{64}$/i.test(fingerprint)) throw new Error('Invalid document fingerprint');
+ipcMain.handle('settings:credential-status', () => credentialStatus());
+
+async function digestPath(fingerprint: unknown): Promise<string> {
+  if (typeof fingerprint !== 'string' || !/^[a-f0-9]{64}$/i.test(fingerprint)) {
+    throw new Error('Invalid document fingerprint');
+  }
   const directory = path.join(app.getPath('userData'), 'digests');
-  fs.mkdirSync(directory, { recursive: true });
+  await fs.mkdir(directory, { recursive: true });
   return path.join(directory, `${fingerprint.toLowerCase()}.json`);
 }
 
-ipcMain.handle('digest:load', async (_event, fingerprint: string) => {
+ipcMain.handle('digest:load', async (_event, fingerprint: unknown) => {
   try {
-    return JSON.parse(fs.readFileSync(digestPath(fingerprint), 'utf-8'));
+    return JSON.parse(await fs.readFile(await digestPath(fingerprint), 'utf-8'));
   } catch {
     return null;
   }
 });
 
-ipcMain.handle('digest:save', async (_event, fingerprint: string, digest: object) => {
-  const target = digestPath(fingerprint);
-  const temporary = `${target}.tmp`;
-  if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-  fs.writeFileSync(temporary, JSON.stringify(digest, null, 2), 'utf-8');
-  if (fs.existsSync(target)) fs.unlinkSync(target);
-  fs.renameSync(temporary, target);
+ipcMain.handle('digest:save', async (_event, fingerprint: unknown, digest: unknown) => {
+  const serialized = JSON.stringify(digest);
+  if (typeof serialized !== 'string' || serialized.length > MAX_DIGEST_BYTES) {
+    throw new Error('Digest is too large to cache.');
+  }
+  await writeAtomically(await digestPath(fingerprint), serialized);
 });
 
-ipcMain.handle('digest:delete', async (_event, fingerprint: string) => {
+ipcMain.handle('digest:delete', async (_event, fingerprint: unknown) => {
   try {
-    fs.unlinkSync(digestPath(fingerprint));
+    await fs.unlink(await digestPath(fingerprint));
   } catch (error: any) {
     if (error?.code !== 'ENOENT') throw error;
   }
 });
 
+// ─── Navigation and window hardening ───
+
+app.on('web-contents-created', (_event, contents) => {
+  // Links such as "Get key" open in the user's browser, never in an Electron
+  // window that could inherit the preload bridge.
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  contents.on('will-navigate', (event, url) => {
+    const current = contents.getURL().split('#')[0];
+    if (url.split('#')[0] !== current) event.preventDefault();
+  });
+  contents.on('will-attach-webview', (event) => event.preventDefault());
+});
+
 // ─── Lifecycle ───
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  // Only clipboard writes are needed (copy buttons). Camera, microphone,
+  // notifications, geolocation and the rest are always refused.
+  session.defaultSession.setPermissionRequestHandler((_contents, permission, callback) => {
+    callback(permission === 'clipboard-sanitized-write');
+  });
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
