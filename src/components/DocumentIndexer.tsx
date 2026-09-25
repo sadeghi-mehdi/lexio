@@ -20,12 +20,15 @@ import {
 } from '../utils/embedding-client';
 import { EMBEDDING_MODEL_ID, vectorsFromBase64, vectorsToBase64 } from '../utils/embeddings';
 import type { DocumentTabSession } from '../stores/useStore';
+import type { Highlight } from '../types';
+import { mergeNotes, NOTES_VERSION, readPageAnnotations, type SavedNotes } from '../utils/pdf-annotations';
 
 // Extracts the text of every open PDF in the background, one tab at a time,
 // active tab first. Text, headings and the outline are cached on disk by file
 // hash, so reopening a PDF does not extract it again.
 
-const TEXT_CACHE_VERSION = 1;
+// Version 2 added the annotations read from the file.
+const TEXT_CACHE_VERSION = 2;
 const BATCH = 10;
 
 interface CachedText {
@@ -34,6 +37,42 @@ interface CachedText {
   pages: Array<[number, string]>;
   headings: Array<[number, string[]]>;
   outline: OutlineEntry[];
+  annotations: Highlight[];
+}
+
+// ─── Notes ───
+
+// The user's annotations for a document are saved automatically, by file
+// hash, together with the ids of the annotations the file itself contained.
+// When the file is opened again, annotations added or deleted by another app
+// in the meantime are taken over (see mergeNotes).
+
+// Tabs whose annotations have been loaded and may be saved, with the file's
+// annotation ids at load time.
+const notesLoaded = new Map<string, { key: string; importedRefs: string[] }>();
+
+async function applyNotes(tabId: string, key: string, fromFile: Highlight[]): Promise<void> {
+  const saved = /^[a-f0-9]{64}$/i.test(key) ? await loadLibrary<SavedNotes>('notes', key) : null;
+  const tab = tabState(tabId);
+  if (!tab) return;
+  useStore.getState().setTabHighlights(mergeNotes(saved, fromFile, tab.highlights), tabId);
+  notesLoaded.set(tabId, { key, importedRefs: fromFile.map((highlight) => highlight.pdfRef!).filter(Boolean) });
+}
+
+let notesTimer = 0;
+function saveNotesSoon(): void {
+  window.clearTimeout(notesTimer);
+  notesTimer = window.setTimeout(() => {
+    const state = useStore.getState();
+    const tabId = state.activeDocumentTabId;
+    const loaded = tabId ? notesLoaded.get(tabId) : undefined;
+    if (!loaded || !/^[a-f0-9]{64}$/i.test(loaded.key)) return;
+    void saveLibrary('notes', loaded.key, {
+      version: NOTES_VERSION,
+      highlights: state.highlights,
+      importedRefs: loaded.importedRefs,
+    } satisfies SavedNotes);
+  }, 800);
 }
 
 // The tab being extracted and a way to stop it. Only one extraction runs at a
@@ -85,6 +124,7 @@ async function extractTab(tabId: string, signal: AbortSignal): Promise<void> {
     if (cached?.version === TEXT_CACHE_VERSION && Array.isArray(cached.pages) && cached.pageCount > 0) {
       store.mergePageTexts(cached.pages, tabId, cached.headings || []);
       store.setDocumentOutline(cached.outline || [], tabId);
+      await applyNotes(tabId, key, cached.annotations || []);
       store.setExtractionProgress(cached.pageCount, true, tabId);
       return;
     }
@@ -96,19 +136,30 @@ async function extractTab(tabId: string, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   store.setDocumentOutline(outline, tabId);
 
-  // Resume after the pages an interrupted run already committed.
+  // Resume after the pages an interrupted run already committed. Annotations
+  // are read for every page, including pages committed earlier.
+  const fromFile: Highlight[] = [];
+  const firstPage = (tabState(tabId)?.extractedPageCount || 0) + 1;
+  for (let pageNumber = 1; pageNumber < firstPage; pageNumber++) {
+    if (signal.aborted) return;
+    const page = await doc.getPage(pageNumber);
+    fromFile.push(...readPageAnnotations(pageNumber, await page.getAnnotations(), (await page.getTextContent()).items, page.getViewport({ scale: 1 })));
+  }
   let batch: Array<[number, string]> = [];
   let headingBatch: Array<[number, string[]]> = [];
-  for (let pageNumber = (tabState(tabId)?.extractedPageCount || 0) + 1; pageNumber <= doc.numPages; pageNumber++) {
+  for (let pageNumber = firstPage; pageNumber <= doc.numPages; pageNumber++) {
     if (signal.aborted) return;
     const page = await doc.getPage(pageNumber);
     const content = await page.getTextContent();
+    const annotations = await page.getAnnotations();
     if (signal.aborted) return;
     const { text, headings } = pageTextFromItems(content.items);
+    fromFile.push(...readPageAnnotations(pageNumber, annotations, content.items, page.getViewport({ scale: 1 })));
     batch.push([pageNumber, text]);
     if (headings.length) headingBatch.push([pageNumber, headings]);
     if (batch.length >= BATCH || pageNumber === doc.numPages) {
       store.mergePageTexts(batch, tabId, headingBatch);
+      if (pageNumber === doc.numPages) await applyNotes(tabId, key || tabId, fromFile);
       store.setExtractionProgress(pageNumber, pageNumber === doc.numPages, tabId);
       batch = [];
       headingBatch = [];
@@ -124,6 +175,7 @@ async function extractTab(tabId: string, signal: AbortSignal): Promise<void> {
       pages: [...finished.pageTexts.entries()],
       headings: [...finished.pageHeadings.entries()],
       outline,
+      annotations: fromFile,
     } satisfies CachedText);
   }
   // A background tab does not need its parsed PDF until it is shown. The
@@ -349,6 +401,14 @@ export default function DocumentIndexer() {
     running?.abort.abort();
     running = null;
   }, []);
+
+  // Save the active tab's annotations whenever they change, once loaded.
+  useEffect(() => useStore.subscribe((state, previous) => {
+    if (state.highlights !== previous.highlights && state.activeDocumentTabId === previous.activeDocumentTabId) saveNotesSoon();
+    for (const tabId of notesLoaded.keys()) {
+      if (tabId !== state.activeDocumentTabId && !state.documentTabs.some((tab) => tab.id === tabId)) notesLoaded.delete(tabId);
+    }
+  }), []);
 
   return null;
 }

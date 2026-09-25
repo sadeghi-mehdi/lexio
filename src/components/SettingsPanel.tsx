@@ -47,6 +47,10 @@ export default function SettingsPanel() {
     window.electronAPI?.credentialStatus().then(setCredentialStatus).catch(() => {});
   }, []);
   const [activeTab, setActiveTab] = useState<AIProvider>(settings.activeProvider);
+  const [userName, setUserName] = useState('');
+  useEffect(() => {
+    window.electronAPI?.userName().then(setUserName).catch(() => {});
+  }, []);
   const [showKey, setShowKey] = useState(false);
 
   const provider = settings.providers[activeTab];
@@ -375,6 +379,34 @@ export default function SettingsPanel() {
                 <p className="text-[11px] text-text-muted mt-1">
                   Sent with each marking, so you can ask things like "list everything I marked as disagree".
                 </p>
+              </SettingField>
+
+              <SettingField label="Your name on annotations">
+                <input
+                  type="text"
+                  value={settings.authorName}
+                  maxLength={120}
+                  placeholder={userName ? `Computer user name (${userName})` : 'Computer user name'}
+                  onChange={(event) => updateSettings({ authorName: event.target.value })}
+                  className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors"
+                />
+                <p className="text-[11px] text-text-muted mt-1">
+                  Written as the author of highlights and comments you save into PDFs, so other readers show who made them.
+                </p>
+              </SettingField>
+
+              <SettingField label="Saving annotations">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.flattenOnSave}
+                    onChange={(event) => updateSettings({ flattenOnSave: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Flatten: draw new highlights into the page instead of saving them as annotations. Use this for printing or for readers that ignore annotations. Flattened highlights can no longer be edited or removed, in Lexio or elsewhere.
+                  </span>
+                </label>
               </SettingField>
 
               <SettingField label="Maximum PDF context characters per request">

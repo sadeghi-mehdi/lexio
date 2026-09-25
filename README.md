@@ -286,6 +286,15 @@ Workspace chat:
 - Your highlights, underlines, strikethroughs and comments are sent with questions, marked inline (`<mark>`, `<u>`, `<del>`, `<note>`) plus a list of all markings. Highlighted passages get extra weight in retrieval; strikethroughs get none. Each highlight color has an editable meaning in Settings.
 - Chats are saved and restored when the app starts. Markdown tables render in answers.
 
+Annotations that other PDF readers understand:
+- Save PDF now writes standard Highlight, Underline and StrikeOut annotations with the comment, author, dates and an appearance stream, instead of flat drawings. Comments are no longer lost. The author defaults to the computer's user name and can be changed in Settings.
+- Highlights, underlines, strikethroughs, sticky notes, text boxes and replies made in other apps (tested with the structures written by Microsoft Edge, Acrobat Online and Foxit PDF) are read when a PDF opens, with the highlighted words recovered from their positions. They can be commented on or removed, and saving updates or removes exactly those annotations. Drawings and shapes are listed read-only.
+- Saving starts from the original file every time and leaves links, forms and other annotations untouched. Positions account for page rotation and cropping (previously highlights were misplaced on such pages).
+- Encrypted PDFs cannot be written; Lexio says so and keeps the notes. Saving a signed PDF asks first, because it invalidates the signature.
+- Notes are saved automatically per PDF and merged on the next open with any changes other apps made to the file.
+- Optional "flatten" draws new highlights into the page for printing.
+- Known limits: pdf.js does not expose an annotation's /NM name or a grouped annotation's own text, so Lexio cannot tell its own saved annotations from other apps' and does not show Acrobat's "replace text" suggestions. Thumbnails show the file's annotations as saved.
+
 ### Unreleased: Security and performance hardening
 
 Security:

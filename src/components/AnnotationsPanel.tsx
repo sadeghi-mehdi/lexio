@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { MessageSquare, FileText, Highlighter, Underline, Strikethrough, Pencil, Trash2 } from 'lucide-react';
+import { MessageSquare, FileText, Highlighter, Underline, Strikethrough, Pencil, Trash2, StickyNote, CornerDownRight } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
 import type { Highlight, HighlightColor, AnnotationType } from '../types';
@@ -17,6 +17,23 @@ const TYPE_ICONS: Record<AnnotationType, React.ReactNode> = {
   highlight: <Highlighter size={10} />,
   underline: <Underline size={10} />,
   strikeout: <Strikethrough size={10} />,
+  note: <StickyNote size={10} />,
+};
+
+// Readable names for annotation types from other apps.
+const SUBTYPE_NAMES: Record<string, string> = {
+  Text: 'sticky note',
+  FreeText: 'text box',
+  Squiggly: 'squiggly underline',
+  Ink: 'drawing',
+  Square: 'rectangle',
+  Circle: 'ellipse',
+  Line: 'line',
+  Polygon: 'polygon',
+  PolyLine: 'polyline',
+  Stamp: 'stamp',
+  FileAttachment: 'attachment',
+  Caret: 'insertion mark',
 };
 
 export default function AnnotationsPanel() {
@@ -75,19 +92,42 @@ export default function AnnotationsPanel() {
               >
                 <div className="flex items-center gap-1.5 mb-1">
                   <span className="text-text-muted">{TYPE_ICONS[h.type || 'highlight']}</span>
-                  <span className="text-[10px] text-text-muted capitalize">{h.type || 'highlight'}</span>
+                  <span className="text-[10px] text-text-muted capitalize">
+                    {(h.pdfSubtype && SUBTYPE_NAMES[h.pdfSubtype]) || (h.type === 'strikeout' ? 'strikethrough' : h.type || 'highlight')}
+                  </span>
+                  {h.author && <span className="text-[10px] text-text-muted">· {h.author}</span>}
+                  {h.source === 'file' && (
+                    <span
+                      className="ml-auto rounded border border-surface-4 px-1 text-[9px] uppercase tracking-wider text-text-muted"
+                      title="Read from the PDF file. Changes are written back when you save the PDF."
+                    >
+                      in PDF
+                    </span>
+                  )}
                 </div>
-                <p className="text-xs text-text-primary leading-relaxed line-clamp-3">
-                  "{h.text}"
-                </p>
+                {h.text && (
+                  <p className="text-xs text-text-primary leading-relaxed line-clamp-3">
+                    "{h.text}"
+                  </p>
+                )}
 
                 {h.comment && (
                   <div className="flex items-start gap-1.5 mt-1.5">
                     <MessageSquare size={11} className="text-text-muted mt-0.5 flex-shrink-0" />
-                    <p className="text-[11px] text-text-secondary">{h.comment}</p>
+                    <p className="text-[11px] text-text-secondary whitespace-pre-wrap">{h.comment}</p>
                   </div>
                 )}
+                {h.replies?.map((reply, index) => (
+                  <div key={index} className="ml-3 mt-1 flex items-start gap-1.5">
+                    <CornerDownRight size={10} className="mt-0.5 flex-shrink-0 text-text-muted" />
+                    <p className="text-[11px] text-text-secondary">
+                      {reply.author && <span className="text-text-muted">{reply.author}: </span>}
+                      {reply.text}
+                    </p>
+                  </div>
+                ))}
 
+                {!h.readOnly && (
                 <div className="mt-2 flex items-center gap-1.5 border-t border-surface-3/50 pt-1.5">
                   <button
                     type="button"
@@ -115,6 +155,7 @@ export default function AnnotationsPanel() {
                     Remove
                   </button>
                 </div>
+                )}
 
               </div>
             ))}

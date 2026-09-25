@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, Menu, net, safeStorage, session, s
 import * as path from 'path';
 import { promises as fs } from 'fs';
 import { createHash, randomUUID } from 'crypto';
+import os from 'os';
 import { mergeSettingsApiKeys, splitSettingsApiKeys } from './credential-settings';
 
 let mainWindow: BrowserWindow | null = null;
@@ -402,6 +403,15 @@ ipcMain.handle('library:delete', async (_event, kind: unknown, key: unknown) => 
     await fs.unlink(await libraryPath(kind, key));
   } catch (error: any) {
     if (error?.code !== 'ENOENT') throw error;
+  }
+});
+
+// The computer's user name, the default author of new annotations.
+ipcMain.handle('app:user-name', () => {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return '';
   }
 });
 

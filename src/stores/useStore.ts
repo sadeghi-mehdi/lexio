@@ -131,6 +131,9 @@ interface AppState {
   ) => void;
   setExtractionProgress: (pageCount: number, complete?: boolean, tabId?: string | null) => void;
   setDocumentOutline: (outline: OutlineEntry[], tabId?: string | null) => void;
+  // Replaces a tab's annotation list (annotations read from the file merged
+  // with saved notes). Not an undoable edit.
+  setTabHighlights: (highlights: Highlight[], tabId?: string | null) => void;
   setEmbeddingState: (status: EmbeddingStatus, progress?: string) => void;
   // Opens a document tab at a page and outlines the page briefly.
   jumpToPage: (tabId: string, page: number) => void;
@@ -498,6 +501,8 @@ export const useStore = create<AppState>((set, get) => ({
     }))),
   setDocumentOutline: (documentOutline, tabId) =>
     set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
+  setTabHighlights: (highlights, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({ highlights }))),
   setEmbeddingState: (embeddingStatus, embeddingProgress = '') => set({ embeddingStatus, embeddingProgress }),
   jumpToPage: (tabId, page) => {
     if (get().activeDocumentTabId !== tabId) get().switchDocumentTab(tabId);

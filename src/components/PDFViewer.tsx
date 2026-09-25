@@ -16,6 +16,8 @@ import { findDocumentMatches, type DocumentSearchMatch } from '../utils/document
 // current page. An A4 canvas at 2x DPR is about 8 MB, so keeping every page a
 // reader scrolls past would grow memory without bound.
 const KEEP_RENDERED_DISTANCE = 5;
+// File annotations that Lexio lists and may hide from pdf.js rendering.
+const HIDEABLE_SUBTYPES = new Set(['Highlight', 'Underline', 'Squiggly', 'StrikeOut', 'Text', 'FreeText']);
 const SEARCH_DEBOUNCE_MS = 150;
 const WHEEL_ZOOM_SETTLE_MS = 150;
 
@@ -469,7 +471,8 @@ export default function PDFViewer() {
     pageNum: number, pageDiv: HTMLDivElement, pageWidth: number, pageHeight: number
   ) => {
     pageDiv.querySelectorAll('.highlight-layer').forEach(el => el.remove());
-    const pageHighlights = highlights.filter(h => h.page === pageNum);
+    // Notes (sticky notes, text boxes) have no marked text; pdf.js draws them.
+    const pageHighlights = highlights.filter(h => h.page === pageNum && h.type !== 'note');
     if (pageHighlights.length === 0) return;
 
     const highlightLayer = document.createElement('div');
@@ -642,9 +645,25 @@ export default function PDFViewer() {
       canvas.style.height = `${viewport.height}px`;
       pageDiv.appendChild(canvas);
 
+      // Highlights, underlines and strikethroughs read from the file are drawn
+      // by Lexio's overlay (so they can be edited and deleted); pdf.js must
+      // not draw them too. Notes deleted in Lexio are hidden until saved.
+      const fileAnnotations = await page.getAnnotations();
+      const listed = new Map(useStore.getState().highlights.filter((h) => h.pdfRef).map((h) => [h.pdfRef!, h]));
+      for (const annotation of fileAnnotations) {
+        if (!HIDEABLE_SUBTYPES.has(annotation.subtype) || annotation.inReplyTo) continue;
+        const highlight = listed.get(annotation.id);
+        doc.annotationStorage.setValue(annotation.id, { noView: !highlight || highlight.type !== 'note' });
+      }
+      if (pdfDocRef.current !== doc || pagesRef.current.get(pageNum) !== pageDiv || !pageDiv.isConnected) return;
+
       const ctx = canvas.getContext('2d')!;
       const renderViewport = page.getViewport({ scale: zoom * dpr });
-      const renderTask = page.render({ canvasContext: ctx, viewport: renderViewport });
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport: renderViewport,
+        annotationMode: pdfjsLib.AnnotationMode.ENABLE_STORAGE,
+      });
       renderTasksRef.current.set(pageNum, renderTask);
       try {
         await renderTask.promise;

@@ -7,7 +7,7 @@ import AISidebar from './components/AISidebar';
 import SettingsPanel from './components/SettingsPanel';
 import WelcomeScreen from './components/WelcomeScreen';
 import ThumbnailSidebar from './components/ThumbnailSidebar';
-import { readPdfFile, savePdfCopy, savePdfWithAnnotations } from './utils/pdf-save';
+import { annotatedPdfBytes, readPdfFile, savePdfCopy } from './utils/pdf-save';
 import { normalizeSettings } from './utils/settings-migration';
 import DocumentIndexer from './components/DocumentIndexer';
 import DocumentTabs from './components/DocumentTabs';
@@ -124,11 +124,11 @@ export default function App() {
         if (!state.pdfFile) return;
         try {
           if (!state.pdfFile.canSaveInPlace) {
-            await savePdfCopy(state.pdfFile, state.highlights);
+            await savePdfCopy(state.pdfFile, state.highlights, state.settings);
             return;
           }
-          const modifiedPdf = await savePdfWithAnnotations(state.pdfFile.data, state.highlights);
-          if (!(await api.savePdfInPlace(state.pdfFile.id, modifiedPdf))) {
+          const modifiedPdf = await annotatedPdfBytes(state.pdfFile, state.highlights, state.settings);
+          if (modifiedPdf && !(await api.savePdfInPlace(state.pdfFile.id, modifiedPdf))) {
             console.error('Failed to save PDF in place.');
           }
         } catch (err) {
@@ -140,7 +140,7 @@ export default function App() {
         const state = useStore.getState();
         if (!state.pdfFile) return;
         try {
-          await savePdfCopy(state.pdfFile, state.highlights);
+          await savePdfCopy(state.pdfFile, state.highlights, state.settings);
         } catch (err) {
           console.error('Failed to save PDF:', err);
         }

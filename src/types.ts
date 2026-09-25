@@ -16,6 +16,7 @@ interface ElectronAPI {
   loadLibrary: (kind: LibraryKind, key: string) => Promise<unknown>;
   saveLibrary: (kind: LibraryKind, key: string, data: unknown) => Promise<void>;
   deleteLibrary: (kind: LibraryKind, key: string) => Promise<void>;
+  userName: () => Promise<string>;
   embeddingStatus: () => Promise<{ installed: boolean; downloading: boolean }>;
   downloadEmbeddingModel: () => Promise<void>;
   loadEmbeddingModel: () => Promise<{ model: Uint8Array; tokenizer: string } | null>;
@@ -58,7 +59,9 @@ export interface PdfFileData {
 
 export type HighlightColor = 'yellow' | 'green' | 'blue' | 'pink' | 'orange';
 
-export type AnnotationType = 'highlight' | 'underline' | 'strikeout';
+// 'note' is a sticky note, text box or drawing read from the PDF file. It
+// has no marked text; pdf.js draws it.
+export type AnnotationType = 'highlight' | 'underline' | 'strikeout' | 'note';
 
 // Rect stored as percentages (0-1) relative to page dimensions for zoom independence
 export interface RelativeRect {
@@ -79,6 +82,17 @@ export interface Highlight {
   createdAt: number;
   // Who wrote the comment. Missing means the user of this computer.
   author?: string;
+  // Set for annotations read from the PDF file. pdfRef is the object id of
+  // the original ("722R"), so saving can update or remove exactly that one.
+  source?: 'lexio' | 'file';
+  pdfRef?: string;
+  pdfSubtype?: string;
+  // Original color (0-1 RGB). Saving keeps it unless the color was changed.
+  pdfColor?: [number, number, number];
+  replies?: Array<{ author: string; text: string; date?: number }>;
+  modifiedAt?: number;
+  // Drawings and shapes from other apps: listed, not editable.
+  readOnly?: boolean;
 }
 
 export interface Annotation {
@@ -196,6 +210,9 @@ export interface AppSettings {
   colorLabels: Record<HighlightColor, string>;
   // Author written into annotations. Empty means the computer's user name.
   authorName: string;
+  // Save highlights as drawings in the page instead of annotations (for
+  // printing or sharing with readers that ignore annotations).
+  flattenOnSave: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -263,4 +280,5 @@ export const DEFAULT_SETTINGS: AppSettings = {
     orange: 'follow up',
   },
   authorName: '',
+  flattenOnSave: false,
 };

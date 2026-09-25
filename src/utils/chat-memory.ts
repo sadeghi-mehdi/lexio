@@ -173,6 +173,7 @@ export function locateMarks(
 // considered the text wrong or irrelevant, so it gets no boost.
 function markWeight(mark: LocatedMark): number {
   if (mark.highlight.type === 'strikeout') return 0;
+  if (mark.highlight.type === 'note') return 1;
   if (mark.highlight.type === 'highlight' || mark.highlight.type === 'underline') return mark.highlight.comment ? 3 : 2;
   return 1;
 }
@@ -205,6 +206,16 @@ export function markRanking(marks: readonly LocatedMark[], question: string): { 
 
 const escapeAttribute = (text: string) => text.replace(/"/g, "'").replace(/[<>]/g, '');
 
+// A marking's comment and its replies (from other apps), with authors.
+function commentsOf(mark: LocatedMark): Array<{ author: string; text: string }> {
+  const comments: Array<{ author: string; text: string }> = [];
+  if (mark.highlight.comment?.trim()) comments.push({ author: mark.highlight.author || 'you', text: mark.highlight.comment.trim() });
+  for (const reply of mark.highlight.replies || []) {
+    if (reply.text.trim()) comments.push({ author: reply.author || 'unknown', text: reply.text.trim() });
+  }
+  return comments;
+}
+
 // Wraps marked text inside a block sent to the model:
 //   <mark id="N3" color="yellow" label="important">...</mark>
 //   <note for="N3" by="you">comment</note>
@@ -235,9 +246,9 @@ export function decorateBlock(
     const tag = highlight.type === 'strikeout' ? 'del' : highlight.type === 'underline' ? 'u' : 'mark';
     const label = colorLabels[highlight.color];
     const attributes = `id="${mark.ref}" color="${highlight.color}"${label ? ` label="${escapeAttribute(label)}"` : ''}`;
-    const note = highlight.comment?.trim()
-      ? `<note for="${mark.ref}" by="${escapeAttribute(highlight.author || 'you')}">${highlight.comment.trim()}</note>`
-      : '';
+    const note = commentsOf(mark)
+      .map((comment) => `<note for="${mark.ref}" by="${escapeAttribute(comment.author)}">${comment.text}</note>`)
+      .join('');
     text = `${text.slice(0, start)}<${tag} ${attributes}>${text.slice(start, end)}</${tag}>${note}${text.slice(end)}`;
   }
   return text;
@@ -264,12 +275,17 @@ export function markingsIndex(
   let used = 0;
   for (const mark of ordered) {
     const { highlight } = mark;
-    const kind = highlight.type === 'strikeout' ? 'struck through' : highlight.type === 'underline' ? 'underlined' : 'highlighted';
+    const kind = highlight.type === 'strikeout' ? 'struck through'
+      : highlight.type === 'underline' ? 'underlined'
+      : highlight.type === 'note' ? 'note on the page'
+      : 'highlighted';
     const label = colorLabels[highlight.color];
     const quote = highlight.text.replace(/\s+/g, ' ').trim();
-    const line = `${mark.ref} ${mark.label} p.${mark.page} ${kind} (${highlight.color}${label ? `: ${label}` : ''}): "${quote.length > 240 ? `${quote.slice(0, 240)}…` : quote}"${
-      highlight.comment?.trim() ? ` · note by ${highlight.author || 'you'}: "${highlight.comment.trim()}"` : ''
-    }`;
+    const comments = commentsOf(mark).map((comment) => ` · note by ${comment.author}: "${comment.text}"`).join('');
+    const line = `${mark.ref} ${mark.label} p.${mark.page} ${kind}${highlight.type === 'note' ? '' : ` (${highlight.color}${label ? `: ${label}` : ''})`}${
+      quote ? `: "${quote.length > 240 ? `${quote.slice(0, 240)}…` : quote}"` : ''
+    }${comments}`;
+    if (highlight.type === 'note' && !comments) continue;
     if (used + line.length > budgetChars) break;
     lines.push(line);
     refs.push(mark);

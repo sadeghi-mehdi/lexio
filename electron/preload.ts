@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadLibrary: (kind: string, key: string) => ipcRenderer.invoke('library:load', kind, key),
   saveLibrary: (kind: string, key: string, data: unknown) => ipcRenderer.invoke('library:save', kind, key, data),
   deleteLibrary: (kind: string, key: string) => ipcRenderer.invoke('library:delete', kind, key),
+  userName: () => ipcRenderer.invoke('app:user-name'),
   embeddingStatus: () => ipcRenderer.invoke('embedding:status'),
   downloadEmbeddingModel: () => ipcRenderer.invoke('embedding:download'),
   loadEmbeddingModel: () => ipcRenderer.invoke('embedding:load'),
