@@ -301,6 +301,12 @@ Cross-document analysis:
 - Research-gap questions separate limitations and future work the authors state (cited) from topics none of the loaded documents cover, which are labeled as such and never presented as gaps in the whole field.
 - Answers with tables have a "Copy table as CSV" button.
 
+Deep mode (opt-in):
+- With "Deep on", the AI searches and reads the PDFs itself before answering, over up to 8 steps, using read-only tools: list documents, get an outline, search passages, read pages, find exact phrases, get your markings, and get a paper card. Each call and the whole turn have reading limits.
+- Every tool only reads. None writes files, uses the network or changes settings, so instructions hidden in a PDF can at most make the AI read more. The prompt also tells the model that tool results are document text, not instructions.
+- Pages a tool returned count as sent, so citation checks work as usual. The answer lists what the AI looked at.
+- Supported for Claude (tool_use), OpenAI and OpenAI-compatible endpoints (tool_calls), Gemini (function calls) and Ollama (tool_calls). If a model or endpoint rejects tools, the chat answers without deep mode and says so. The request formats follow each API's documentation and are covered by tests with recorded stream formats; they have not been run against the live APIs from this environment.
+
 ### Unreleased: Security and performance hardening
 
 Security:

@@ -138,5 +138,6 @@ export function normalizeSettings(raw: unknown): AppSettings {
     ) as Record<HighlightColor, string>,
     authorName: typeof source.authorName === 'string' ? source.authorName.slice(0, 120) : DEFAULT_SETTINGS.authorName,
     flattenOnSave: typeof source.flattenOnSave === 'boolean' ? source.flattenOnSave : DEFAULT_SETTINGS.flattenOnSave,
+    deepMode: typeof source.deepMode === 'boolean' ? source.deepMode : DEFAULT_SETTINGS.deepMode,
   };
 }

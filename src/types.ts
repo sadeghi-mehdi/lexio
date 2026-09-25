@@ -157,6 +157,8 @@ export interface ChatMessage {
   sources?: ContextSource[];
   notes?: NoteReference[];
   contextDescription?: string;
+  // Deep mode: what the model searched and read, in order.
+  toolLog?: string[];
 }
 
 // A document a conversation has used, with the label it keeps in that
@@ -213,6 +215,8 @@ export interface AppSettings {
   // Save highlights as drawings in the page instead of annotations (for
   // printing or sharing with readers that ignore annotations).
   flattenOnSave: boolean;
+  // Deep mode: the model searches and reads the documents itself with tools.
+  deepMode: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -281,4 +285,5 @@ export const DEFAULT_SETTINGS: AppSettings = {
   },
   authorName: '',
   flattenOnSave: false,
+  deepMode: false,
 };

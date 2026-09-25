@@ -14,6 +14,7 @@ import {
   Check,
   StickyNote,
   Layers,
+  Telescope,
 } from 'lucide-react';
 import { useStore, WORKSPACE_CHAT, type DocumentTabSession } from '../stores/useStore';
 import { providers } from '../providers/ai-providers';
@@ -31,6 +32,7 @@ import {
   type OpenDocument,
 } from '../utils/workspace-chat';
 import { CARD_VERSION, type PaperCard } from '../utils/paper-cards';
+import { runDeepMode, toolsUnsupported } from '../utils/deep-mode';
 import { documentKey, tabDocumentIndex } from './DocumentIndexer';
 import AnnotationsPanel from './AnnotationsPanel';
 import { copyText } from '../utils/clipboard';
@@ -257,6 +259,7 @@ export default function AISidebar() {
     const abort = new AbortController();
     registerChatRequest(WORKSPACE_CHAT, abort);
     let streamFrame = 0;
+    let pendingDeepText = '';
     try {
       const provider = providers[state.settings.activeProvider];
       if (!config.enabled) throw new Error(`${config.name} is disabled. Enable it in Settings before sending a message.`);
@@ -279,9 +282,63 @@ export default function AISidebar() {
           useStore.getState().updateLastAssistantMessage(convId, status);
         },
       };
+      // Deep mode: the model searches and reads with tools. A selection or
+      // an analysis uses the normal path. If the model rejects tools, answer
+      // normally and say so.
+      let deepNote = '';
+      if (state.settings.deepMode && !analyze && !selection) {
+        try {
+          const deep = await runDeepMode({
+            documents: scoped.filter((document) => document.ready).map((document) => ({
+              label: label(document.key),
+              key: document.key,
+              index: document.index(),
+              vectors: document.vectors?.vectors,
+              windowPassages: document.vectors?.passageOf,
+              highlights: document.tab.highlights,
+            })),
+            conversation: common.conversation,
+            labelOf: (key) => label(key) || undefined,
+            settings: state.settings,
+            config,
+            signal: abort.signal,
+            queryVector: embedQuery,
+            loadCard: (key) => loadCard(key, config.model),
+            onText: (partial) => {
+              pendingDeepText = partial;
+              if (!streamFrame) streamFrame = window.requestAnimationFrame(() => {
+                streamFrame = 0;
+                useStore.getState().updateLastAssistantMessage(convId, pendingDeepText);
+              });
+            },
+            onActivity: (log) => {
+              setContextStatus(log[log.length - 1] + '…');
+              useStore.getState().patchLastAssistantMessage(convId, { toolLog: log });
+            },
+          });
+          window.cancelAnimationFrame(streamFrame);
+          streamFrame = 0;
+          useStore.getState().patchLastAssistantMessage(convId, {
+            content: deep.text,
+            sources: deep.sources,
+            notes: deep.notes,
+            toolLog: deep.log,
+            contextDescription: `deep mode (${deep.log.length} tool calls)`,
+            status: 'done',
+          });
+          return;
+        } catch (error) {
+          if (!toolsUnsupported(error)) throw error;
+          window.cancelAnimationFrame(streamFrame);
+          streamFrame = 0;
+          deepNote = ' · deep mode is not supported by this model, answered normally';
+          useStore.getState().patchLastAssistantMessage(convId, { content: '', toolLog: undefined });
+        }
+      }
       const request = analyze
         ? await prepareAnalysis({ ...common, question, saveCard })
         : await prepareRequest({ ...common, question, selection, queryVector: embedQuery });
+      request.description += deepNote;
       setContextStatus(`Using ${request.description}${request.notes.length ? ` and ${request.notes.length} of your markings` : ''}`);
       useStore.getState().patchLastAssistantMessage(convId, {
         content: '',
@@ -553,6 +610,15 @@ export default function AISidebar() {
                   <StickyNote size={10} /> Notes {settings.includeNotes ? 'on' : 'off'}
                 </button>
                 <button
+                  onClick={() => updateSettings({ deepMode: !settings.deepMode })}
+                  className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${settings.deepMode ? 'text-accent-light' : 'text-text-muted hover:text-text-secondary'}`}
+                  title={settings.deepMode
+                    ? 'Deep mode on: the AI searches and reads the PDFs itself with tools over several steps. Slower, and needs a model that supports tools.'
+                    : 'Deep mode off. Turn on to let the AI search and read the PDFs itself for complex questions.'}
+                >
+                  <Telescope size={10} /> Deep {settings.deepMode ? 'on' : 'off'}
+                </button>
+                <button
                   onClick={() => sendMessage(true)}
                   disabled={isStreaming || !anyReady}
                   className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:text-accent-light disabled:opacity-40"
@@ -718,6 +784,14 @@ const ChatBubble = memo(function ChatBubble({
           <div className="mt-2 border-t border-surface-3/70 pt-1.5 text-[10px] text-text-muted">
             {message.providerId ? `${message.providerId} · ` : ''}{message.model}
             {message.status === 'aborted' ? ' · stopped' : ''}
+            {message.toolLog?.length ? (
+              <details className="mt-1">
+                <summary className="cursor-pointer">What the AI looked at ({message.toolLog.length})</summary>
+                <ul className="mt-1 list-disc pl-4">
+                  {message.toolLog.map((entry, index) => <li key={index}>{entry}</li>)}
+                </ul>
+              </details>
+            ) : null}
             {message.contextDescription ? ` · used ${message.contextDescription}` : ''}
             {csv && (
               <button
