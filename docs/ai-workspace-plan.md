@@ -25,6 +25,10 @@ One AI chat that works across all open PDFs:
 | Cross-document analysis | Explicit button. |
 | Chats | Saved to disk, per PDF, together with notes. |
 | Annotations | Saved as standard PDF annotations that other readers understand (section 9). |
+| Color labels | Yes, editable in Settings (section 6.3). |
+| Flatten when saving | Yes, as an option, off by default. |
+| Annotation author | Defaults to the computer's user name, editable in Settings. |
+| Read-test files | 3 annotated papers supplied (see "Annotated test files"). |
 
 Assumed until you say otherwise:
 
@@ -187,7 +191,8 @@ Earlier work <del id="N9">reported no temperature effect</del> [...]
 - **Ranking:** a third ranking list, "passages overlapping your markings", is merged into rank fusion. Relevant highlighted passages then rise without drowning out better matches. Weights by type: highlight and underline highest, comment-only medium. Strikethrough adds no boost, but the passage still gets its `<del>` mark if sent.
 - **Reserved share:** up to about 15% of the budget is held for highlighted passages that are relevant to the question, so they make it in even when slightly behind on keyword score.
 - **Highlights index:** a compact list of all markings in scope goes at the top of the context, capped by budget. Example: `N7 D2 p.14 highlight: "rut depth doubled above 45 °C" · note: "Check if…"`. The model then knows what you marked even when that passage was not retrieved, and can ask for it in deep mode.
-- **Settings:** "Give my highlights extra weight" (on by default). Optional color labels, for example yellow = key finding, pink = disagree, green = use in my paper. Labels are sent with each mark and can be used in questions.
+- **Settings:** "Give my highlights extra weight" (on by default).
+- **Color labels:** each Lexio color gets an editable label. Starting defaults: yellow = important, green = use in my work, blue = method or definition, pink = disagree or question, orange = follow up. Labels are sent with each mark (`<mark color="pink" label="disagree">`) and can be used in questions ("list everything I marked as disagree"). Colors from other apps are matched to the nearest Lexio color for their label, but their exact color is kept in the file.
 
 ### 6.4 Other places
 
@@ -279,6 +284,27 @@ Limits, shown to the user instead of failing silently:
 - **Rendering check:** render saved files with PDFium (`pypdfium2`, which I can install here) to confirm Chrome/Edge draw them. Poppler can be added if its tools can be installed here.
 - **Manual check (needs you):** Acrobat Reader, macOS Preview and Zotero. I'd also like 3-5 PDFs annotated in those apps as read test fixtures.
 
+## Annotated test files
+
+Three Elsevier papers with annotations, checked with pdf.js and pdf-lib:
+
+| File | Pages | Annotations | What they show |
+|---|---|---|---|
+| S0950061821038940 | 26 | 3 highlights (1 with a comment), 3 popups, 586 links | Saved as an appended update. No author. Unique ids (`/NM`) are UUIDs. The drawing uses a named form object (`MWFOForm`). |
+| S2352340923007278 | 8 | 3 highlights (1 with a comment), 1 underline, 1 strikethrough, 5 popups, 43 links | Same app as the file above, with 2 appended updates. |
+| S0262885616302153 | 17 | 1 highlight, 1 underline, 1 strikethrough, 3 popups, 189 links | A different app. It rewrote the whole file with compressed object streams. It records the author (`/T meesd`), a subject (`/Subj`) and a border, and draws highlights with the Multiply blend mode. |
+
+What this confirms for the design:
+
+- All files store the corners of each marked line as top-left, top-right, bottom-left, bottom-right. That is the order Lexio will write.
+- Every markup has a linked `/Popup`. Its comment is duplicated on the parent annotation. Lexio reads the parent and keeps the popup linked when editing.
+- The author can be missing. Lexio shows "unknown author" and never makes one up.
+- Hundreds of link annotations sit in the same `/Annots` list. Saving must leave them untouched.
+- A quick test recovered the marked words from the corner positions on all 11 markups. The edges were a character or two off because the test assumed equal-width characters. The app uses real per-character boxes and snaps to word edges.
+- The recovered text contains line-break hyphens ("includ- ing"), which the hyphen fix in section 1 handles.
+
+These papers are publisher content, so they are not committed to the repository. Tests in the repository use small generated PDFs that copy the same annotation structures. The real files are used for local checks only.
+
 ## Phases
 
 | # | Phase | Main files |
@@ -315,7 +341,4 @@ Each phase is its own commit. Old page-index code is removed once phase 2 beats 
 
 ## Open questions
 
-1. **Color labels:** do you want them? If yes, what default meanings?
-2. **Flatten when saving:** include the option, off by default?
-3. **Your name for annotations:** default to the operating-system user name, or leave empty until you set it?
-4. **Test fixtures:** can you share 3-5 PDFs annotated in Acrobat, Preview and Zotero?
+1. Which apps made the three annotated test files? The first and third look like one app, the second a different one.
