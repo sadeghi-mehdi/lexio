@@ -92,3 +92,12 @@ test('cloud page indexing asks first and the generic endpoint has no default hos
   assert.equal(settings.providers.openaiCompatible.baseUrl, '');
   assert.equal(normalizeSettings({ digestAutoCloud: true }).digestAutoCloud, true);
 });
+
+test('provider context window overrides are kept and clamped', () => {
+  const settings = normalizeSettings({
+    providers: { ollama: { contextTokens: 32768 }, claude: { contextTokens: -5 }, gemini: { contextTokens: 'x' } },
+  });
+  assert.equal(settings.providers.ollama.contextTokens, 32768);
+  assert.equal(settings.providers.claude.contextTokens, 0);
+  assert.equal(settings.providers.gemini.contextTokens, 0);
+});

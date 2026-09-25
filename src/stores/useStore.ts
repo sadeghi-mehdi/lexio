@@ -16,6 +16,7 @@ import type {
 import { DEFAULT_SETTINGS } from '../types.ts';
 import { abortChatRequest } from '../utils/chat-request-registry.ts';
 import { releaseRegisteredDocument } from '../utils/pdf-document-registry.ts';
+import type { OutlineEntry } from '../utils/text-index.ts';
 
 export type ToolType = 'select' | AnnotationType | 'comment';
 
@@ -30,6 +31,8 @@ export interface DocumentTabSession {
   identity: string;
   pdfFile: PdfFileData;
   pageTexts: Map<number, string>;
+  pageHeadings: Map<number, string[]>;
+  documentOutline: OutlineEntry[];
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -66,6 +69,8 @@ interface AppState {
   pdfFile: PdfFileData | null;
   documentSessionId: number;
   pageTexts: Map<number, string>;
+  pageHeadings: Map<number, string[]>;
+  documentOutline: OutlineEntry[];
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -113,8 +118,15 @@ interface AppState {
   setPdfFile: (file: PdfFileData | null) => void;
   switchDocumentTab: (id: string) => void;
   closeDocumentTab: (id: string) => void;
-  mergePageTexts: (entries: ReadonlyArray<readonly [number, string]>) => void;
-  setExtractionProgress: (pageCount: number, complete?: boolean) => void;
+  // Text extraction runs for every open tab in the background, so these take
+  // the target tab. Without one they update the active tab.
+  mergePageTexts: (
+    entries: ReadonlyArray<readonly [number, string]>,
+    tabId?: string | null,
+    headings?: ReadonlyArray<readonly [number, string[]]>
+  ) => void;
+  setExtractionProgress: (pageCount: number, complete?: boolean, tabId?: string | null) => void;
+  setDocumentOutline: (outline: OutlineEntry[], tabId?: string | null) => void;
   setDocumentFingerprint: (fingerprint: string) => void;
   setDocumentDigest: (digest: DocumentDigest | null) => void;
   setDigestState: (status: DigestStatus, progress?: string, error?: string) => void;
@@ -183,6 +195,8 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     identity: documentIdentity(state.pdfFile),
     pdfFile: state.pdfFile,
     pageTexts: state.pageTexts,
+    pageHeadings: state.pageHeadings,
+    documentOutline: state.documentOutline,
     extractedPageCount: state.extractedPageCount,
     documentTextReady: state.documentTextReady,
     numPages: state.numPages,
@@ -218,6 +232,8 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     identity: documentIdentity(file),
     pdfFile: file,
     pageTexts: new Map(),
+    pageHeadings: new Map(),
+    documentOutline: [],
     extractedPageCount: 0,
     documentTextReady: false,
     numPages: 0,
@@ -253,6 +269,8 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     pdfFile: session.pdfFile,
     documentSessionId: nextSessionId,
     pageTexts: session.pageTexts,
+    pageHeadings: session.pageHeadings,
+    documentOutline: session.documentOutline,
     extractedPageCount: session.extractedPageCount,
     documentTextReady: session.documentTextReady,
     numPages: session.numPages,
@@ -282,6 +300,25 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
   };
 }
 
+type TabFields = Omit<DocumentTabSession, 'id' | 'identity' | 'pdfFile'>;
+
+// Applies a change to one document tab. The active tab's fields live at the
+// top level of the state, other tabs' fields in documentTabs.
+function patchTab(
+  state: AppState,
+  tabId: string | null | undefined,
+  change: (tab: TabFields) => Partial<TabFields>
+): Partial<AppState> {
+  if (!tabId || tabId === state.activeDocumentTabId) {
+    return change(state as unknown as TabFields) as Partial<AppState>;
+  }
+  const index = state.documentTabs.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return {};
+  const documentTabs = [...state.documentTabs];
+  documentTabs[index] = { ...documentTabs[index], ...change(documentTabs[index]) };
+  return { documentTabs };
+}
+
 export const useStore = create<AppState>((set, get) => ({
   // ─── Initial State ───
 
@@ -291,6 +328,8 @@ export const useStore = create<AppState>((set, get) => ({
   pdfFile: null,
   documentSessionId: 0,
   pageTexts: new Map(),
+  pageHeadings: new Map(),
+  documentOutline: [],
   extractedPageCount: 0,
   documentTextReady: false,
   numPages: 0,
@@ -357,6 +396,8 @@ export const useStore = create<AppState>((set, get) => ({
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
+        pageHeadings: new Map(),
+        documentOutline: [],
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -435,6 +476,8 @@ export const useStore = create<AppState>((set, get) => ({
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
+        pageHeadings: new Map(),
+        documentOutline: [],
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -461,21 +504,26 @@ export const useStore = create<AppState>((set, get) => ({
   },
   // Extraction commits pages in batches. Copying the Map once per batch
   // instead of once per page keeps extraction linear in the page count.
-  mergePageTexts: (entries) =>
-    set((s) => {
-      if (entries.length === 0) return s;
-      const newMap = new Map(s.pageTexts);
-      for (const [page, text] of entries) newMap.set(page, text);
-      return { pageTexts: newMap };
-    }),
-  setExtractionProgress: (extractedPageCount, documentTextReady = false) => set({
-    extractedPageCount,
-    documentTextReady,
-    digestStatus: documentTextReady ? 'idle' : 'extracting',
-    digestProgress: documentTextReady
-      ? 'PDF text extraction complete'
-      : `Extracting PDF text — page ${extractedPageCount}`,
-  }),
+  mergePageTexts: (entries, tabId, headings = []) =>
+    set((s) => patchTab(s, tabId, (tab) => {
+      if (entries.length === 0 && headings.length === 0) return {};
+      const pageTexts = new Map(tab.pageTexts);
+      for (const [page, text] of entries) pageTexts.set(page, text);
+      const pageHeadings = headings.length ? new Map(tab.pageHeadings) : tab.pageHeadings;
+      for (const [page, lines] of headings) pageHeadings.set(page, lines);
+      return { pageTexts, pageHeadings };
+    })),
+  setExtractionProgress: (extractedPageCount, documentTextReady = false, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({
+      extractedPageCount,
+      documentTextReady,
+      digestStatus: documentTextReady ? 'idle' : 'extracting',
+      digestProgress: documentTextReady
+        ? 'PDF text extraction complete'
+        : `Extracting PDF text — page ${extractedPageCount}`,
+    }))),
+  setDocumentOutline: (documentOutline, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
   setDocumentFingerprint: (documentFingerprint) => set({ documentFingerprint }),
   setDocumentDigest: (documentDigest) => set({ documentDigest }),
   setDigestState: (digestStatus, digestProgress = '', digestError = '') => set({

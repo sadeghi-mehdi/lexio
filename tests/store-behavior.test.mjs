@@ -231,3 +231,24 @@ test('annotations can be commented, removed, undone, and redone', () => {
   useStore.getState().redo();
   assert.equal(useStore.getState().highlights.length, 0);
 });
+
+test('background extraction writes to its own tab, not the active one', () => {
+  useStore.getState().setPdfFile(null);
+  useStore.getState().setPdfFile(pdf('first.pdf'));
+  const firstTab = useStore.getState().activeDocumentTabId;
+  useStore.getState().setPdfFile(pdf('second.pdf'));
+  const store = useStore.getState();
+  store.mergePageTexts([[1, 'background text']], firstTab, [[1, ['1 Introduction']]]);
+  store.setExtractionProgress(1, true, firstTab);
+  store.setDocumentOutline([{ title: 'Intro', page: 1, depth: 0 }], firstTab);
+  const state = useStore.getState();
+  assert.equal(state.pageTexts.size, 0);
+  assert.equal(state.documentTextReady, false);
+  const background = state.documentTabs.find((tab) => tab.id === firstTab);
+  assert.equal(background.pageTexts.get(1), 'background text');
+  assert.deepEqual(background.pageHeadings.get(1), ['1 Introduction']);
+  assert.equal(background.documentTextReady, true);
+  assert.equal(background.documentOutline[0].title, 'Intro');
+  useStore.getState().switchDocumentTab(firstTab);
+  assert.equal(useStore.getState().pageTexts.get(1), 'background text');
+});

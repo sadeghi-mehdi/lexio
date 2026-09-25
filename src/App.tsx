@@ -10,6 +10,7 @@ import ThumbnailSidebar from './components/ThumbnailSidebar';
 import { readPdfFile, savePdfCopy, savePdfWithAnnotations } from './utils/pdf-save';
 import { normalizeSettings } from './utils/settings-migration';
 import DocumentDigestManager from './components/DocumentDigestManager';
+import DocumentIndexer from './components/DocumentIndexer';
 import DocumentTabs from './components/DocumentTabs';
 
 export default function App() {
@@ -284,6 +285,7 @@ export default function App() {
 
       {/* Settings Modal */}
       {settingsOpen && <SettingsPanel />}
+      <DocumentIndexer />
       <DocumentDigestManager />
     </div>
   );

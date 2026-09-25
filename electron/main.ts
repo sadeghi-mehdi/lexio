@@ -400,6 +400,45 @@ ipcMain.handle('digest:delete', async (_event, fingerprint: unknown) => {
   }
 });
 
+// Per-document data (extracted text, notes, chats, embeddings, OCR results),
+// stored as one JSON file per kind and key in the app data folder. Keys are
+// SHA-256 file hashes (or a hash of several for chats spanning documents),
+// so the renderer can never choose a path.
+const LIBRARY_KINDS = new Set(['text', 'notes', 'chats', 'cards', 'embeddings', 'ocr']);
+const MAX_LIBRARY_BYTES = 80 * 1024 * 1024;
+
+async function libraryPath(kind: unknown, key: unknown): Promise<string> {
+  if (typeof kind !== 'string' || !LIBRARY_KINDS.has(kind)) throw new Error('Invalid data kind');
+  if (typeof key !== 'string' || !/^[a-f0-9]{64}$/i.test(key)) throw new Error('Invalid document key');
+  const directory = path.join(app.getPath('userData'), 'library', kind);
+  await fs.mkdir(directory, { recursive: true });
+  return path.join(directory, `${key.toLowerCase()}.json`);
+}
+
+ipcMain.handle('library:load', async (_event, kind: unknown, key: unknown) => {
+  try {
+    return JSON.parse(await fs.readFile(await libraryPath(kind, key), 'utf-8'));
+  } catch {
+    return null;
+  }
+});
+
+ipcMain.handle('library:save', async (_event, kind: unknown, key: unknown, data: unknown) => {
+  const serialized = JSON.stringify(data);
+  if (typeof serialized !== 'string' || serialized.length > MAX_LIBRARY_BYTES) {
+    throw new Error('Document data is too large to save.');
+  }
+  await writeAtomically(await libraryPath(kind, key), serialized);
+});
+
+ipcMain.handle('library:delete', async (_event, kind: unknown, key: unknown) => {
+  try {
+    await fs.unlink(await libraryPath(kind, key));
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+});
+
 // ─── Navigation and window hardening ───
 
 app.on('web-contents-created', (_event, contents) => {

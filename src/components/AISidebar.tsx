@@ -25,6 +25,7 @@ import {
 } from '../utils/document-context';
 import { retrieveDigestContext } from '../utils/document-digest';
 import { requestProviderText } from '../utils/provider-request';
+import { requestBudget } from '../utils/context-budget';
 import {
   abortChatRequest,
   clearChatRequest,
@@ -278,9 +279,12 @@ export default function AISidebar() {
         return;
       }
 
+      // The document context must fit the model's window next to the history
+      // and the answer, and never exceed the user's maximum.
+      const budget = requestBudget(activeProviderConfig, settings.maxContextChars);
       const maxContextChars = Math.max(
-        10000,
-        Math.min(2000000, Math.round(settings.maxContextChars))
+        4000,
+        Math.min(2000000, Math.round(settings.maxContextChars), Math.floor(budget.documentTokens * 3.5))
       );
 
       let contextText = '';

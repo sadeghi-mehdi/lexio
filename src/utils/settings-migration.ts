@@ -42,6 +42,7 @@ function mergeProvider(id: AIProvider, raw: unknown): ProviderConfig {
     baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl : fallback.baseUrl,
     model: id !== 'openaiCompatible' && modelIsGenericOnly ? fallback.model : requestedModel,
     models,
+    contextTokens: clampInteger(raw.contextTokens, 0, 0, 10_000_000),
   };
 }
 

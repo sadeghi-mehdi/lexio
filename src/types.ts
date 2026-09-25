@@ -2,6 +2,8 @@
 
 type Unsubscribe = () => void;
 
+export type LibraryKind = 'text' | 'notes' | 'chats' | 'cards' | 'embeddings' | 'ocr';
+
 interface ElectronAPI {
   openPdf: () => Promise<void>;
   openDroppedPdf: (file: File) => Promise<PdfFileData | null>;
@@ -14,6 +16,9 @@ interface ElectronAPI {
   loadDigest: (fingerprint: string) => Promise<unknown>;
   saveDigest: (fingerprint: string, digest: DocumentDigest) => Promise<void>;
   deleteDigest: (fingerprint: string) => Promise<void>;
+  loadLibrary: (kind: LibraryKind, key: string) => Promise<unknown>;
+  saveLibrary: (kind: LibraryKind, key: string, data: unknown) => Promise<void>;
+  deleteLibrary: (kind: LibraryKind, key: string) => Promise<void>;
   onPdfOpened: (cb: (data: PdfFileData) => void) => Unsubscribe;
   onToggleSidebar: (cb: () => void) => Unsubscribe;
   onZoomIn: (cb: () => void) => Unsubscribe;
@@ -96,6 +101,9 @@ export interface ProviderConfig {
   baseUrl?: string;
   model: string;
   models: string[];
+  // Context window in tokens. 0 or missing means automatic (known model size,
+  // or a provider default). For Ollama it is also sent as num_ctx.
+  contextTokens?: number;
 }
 
 export interface ChatMessage {

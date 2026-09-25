@@ -16,8 +16,6 @@ import { findDocumentMatches, type DocumentSearchMatch } from '../utils/document
 // current page. An A4 canvas at 2x DPR is about 8 MB, so keeping every page a
 // reader scrolls past would grow memory without bound.
 const KEEP_RENDERED_DISTANCE = 5;
-// Extracted page text is committed to the store in batches of this size.
-const EXTRACTION_BATCH = 25;
 const SEARCH_DEBOUNCE_MS = 150;
 const WHEEL_ZOOM_SETTLE_MS = 150;
 
@@ -272,8 +270,8 @@ export default function PDFViewer() {
   const {
     hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts,
     highlights, activeTool, activeHighlightColor,
-    setNumPages, setCurrentPage, mergePageTexts, addHighlight,
-    setExtractionProgress, setSelectedTextForAI, clearSelectedTextForAI,
+    setNumPages, setCurrentPage, addHighlight,
+    setSelectedTextForAI, clearSelectedTextForAI,
     setSidebarOpen, setSidebarTab,
   } = useStore(useShallow((state) => ({
     hasPdf: Boolean(state.pdfFile),
@@ -288,9 +286,7 @@ export default function PDFViewer() {
     activeHighlightColor: state.activeHighlightColor,
     setNumPages: state.setNumPages,
     setCurrentPage: state.setCurrentPage,
-    mergePageTexts: state.mergePageTexts,
     addHighlight: state.addHighlight,
-    setExtractionProgress: state.setExtractionProgress,
     setSelectedTextForAI: state.setSelectedTextForAI,
     clearSelectedTextForAI: state.clearSelectedTextForAI,
     setSidebarOpen: state.setSidebarOpen,
@@ -535,7 +531,6 @@ export default function PDFViewer() {
     const stillCurrent = () => !cancelled && viewerIsActive();
 
     const loadPdf = async () => {
-      const textAlreadyExtracted = useStore.getState().documentTextReady;
       // The parsed document is shared with the thumbnail sidebar and survives
       // tab switches, so switching back to a tab does not parse the file again.
       const doc = await loadRegisteredDocument(viewerTabId, () => openPdfDocument(pdfFile.data));
@@ -558,42 +553,20 @@ export default function PDFViewer() {
       setPageBaseSizes(sizes);
       setPdfDocument(doc);
       setNumPages(doc.numPages);
-      if (sizesKnown && textAlreadyExtracted) return;
+      if (sizesKnown) return;
 
-      // One background pass reads each page once for both its real size and
-      // (on first open) its text. Text is committed in batches so the store
-      // and its subscribers update once per batch, not once per page.
+      // One background pass reads each page's real size. Text is extracted
+      // separately for every open tab by DocumentIndexer.
       const actualSizes = new Map(sizes);
       let sizesChanged = false;
-      let batch: Array<[number, string]> = [];
       for (let i = 1; i <= doc.numPages; i++) {
         if (!stillCurrent()) return;
         const page = await doc.getPage(i);
-        if (!sizesKnown) {
-          const viewport = page.getViewport({ scale: 1 });
-          const assumed = actualSizes.get(i);
-          if (!assumed || assumed.width !== viewport.width || assumed.height !== viewport.height) {
-            actualSizes.set(i, { width: viewport.width, height: viewport.height });
-            sizesChanged = true;
-          }
-        }
-        if (!textAlreadyExtracted) {
-          const textContent = await loadTextContent(page);
-          if (!stillCurrent()) return;
-          batch.push([i, textContent.items
-            .map((item: any) => `${item.str || ''}${item.hasEOL ? '\n' : ' '}`)
-            .join('')
-            .replace(/[ \t]+\n/g, '\n')
-            .trim()]);
-          // Keep the text content only if the page is about to be rendered.
-          if (Math.abs(i - useStore.getState().currentPage) > KEEP_RENDERED_DISTANCE) {
-            textContentCacheRef.current.delete(i);
-          }
-          if (batch.length >= EXTRACTION_BATCH || i === doc.numPages) {
-            mergePageTexts(batch);
-            setExtractionProgress(i, i === doc.numPages);
-            batch = [];
-          }
+        const viewport = page.getViewport({ scale: 1 });
+        const assumed = actualSizes.get(i);
+        if (!assumed || assumed.width !== viewport.width || assumed.height !== viewport.height) {
+          actualSizes.set(i, { width: viewport.width, height: viewport.height });
+          sizesChanged = true;
         }
       }
       if (!stillCurrent()) return;
@@ -607,7 +580,7 @@ export default function PDFViewer() {
       cancelled = true;
       pdfDocRef.current = null;
     };
-  }, [activeDocumentTabId, documentSessionId, setNumPages, mergePageTexts, setExtractionProgress, loadTextContent]);
+  }, [activeDocumentTabId, documentSessionId, setNumPages]);
 
   // Cancel in-flight renders when the viewer unmounts (tab switch or close).
   // The parsed document itself stays in the registry until its tab closes.

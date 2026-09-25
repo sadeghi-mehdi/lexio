@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { X, Eye, EyeOff, Check, ExternalLink } from 'lucide-react';
 import { useStore } from '../stores/useStore';
+import { contextWindowTokens } from '../utils/context-budget';
 import type { AIProvider } from '../types';
 import { normalizeSettings } from '../utils/settings-migration';
 
@@ -250,6 +251,26 @@ export default function SettingsPanel() {
                 {provider.models.length > 0
                   ? 'Select a preset or type a custom model name'
                   : 'Enter the exact model ID supported by this endpoint'}
+              </p>
+            </SettingField>
+
+            <SettingField label="Context window (tokens)">
+              <input
+                type="number"
+                min={0}
+                step={1024}
+                value={provider.contextTokens || ''}
+                placeholder={`Automatic (${contextWindowTokens({ ...provider, contextTokens: 0 }).toLocaleString()})`}
+                onChange={(e) => {
+                  const value = Math.max(0, Math.round(Number(e.target.value) || 0));
+                  updateProviderConfig(activeTab, { contextTokens: value });
+                }}
+                className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors font-mono"
+              />
+              <p className="text-[11px] text-text-muted mt-1">
+                {activeTab === 'ollama'
+                  ? 'Sent to Ollama as num_ctx. Larger values let more of the PDF fit but need more memory.'
+                  : 'Leave empty to use the known size for this model. Lexio fits the PDF text, chat history and answer inside it.'}
               </p>
             </SettingField>
 

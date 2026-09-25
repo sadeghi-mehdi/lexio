@@ -1,3 +1,4 @@
+import { contextWindowTokens } from '../utils/context-budget.ts';
 import type { ProviderConfig, ChatMessage } from '../types.ts';
 
 // ─── Base Interface ───
@@ -30,6 +31,9 @@ const ollamaProvider: AIProviderInterface = {
         ...messages.map((m) => ({ role: m.role, content: m.content })),
       ],
       stream: true,
+      // Without num_ctx Ollama uses its own small default and silently drops
+      // the start of longer prompts, which is where the document text is.
+      options: { num_ctx: contextWindowTokens(config) },
     };
 
     const res = await fetch(url, {
