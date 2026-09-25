@@ -3,8 +3,23 @@ import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
 import { openPdfDocument, type pdfjsLib } from '../utils/pdfjs';
 import { loadRegisteredDocument, releaseRegisteredDocument } from '../utils/pdf-document-registry';
-import { pageTextFromItems, type OutlineEntry } from '../utils/text-index';
+import {
+  embeddingWindows,
+  getDocumentIndex,
+  pageTextFromItems,
+  type DocumentIndex,
+  type OutlineEntry,
+} from '../utils/text-index';
 import { loadLibrary, saveLibrary } from '../utils/library-store';
+import {
+  documentVectors,
+  downloadEmbeddingModel,
+  embeddingInstalled,
+  embedTexts,
+  loadEmbedder,
+} from '../utils/embedding-client';
+import { EMBEDDING_MODEL_ID, vectorsFromBase64, vectorsToBase64 } from '../utils/embeddings';
+import type { DocumentTabSession } from '../stores/useStore';
 
 // Extracts the text of every open PDF in the background, one tab at a time,
 // active tab first. Text, headings and the outline are cached on disk by file
@@ -116,6 +131,149 @@ async function extractTab(tabId: string, signal: AbortSignal): Promise<void> {
   if (useStore.getState().activeDocumentTabId !== tabId) releaseRegisteredDocument(tabId);
 }
 
+type TabLike = Pick<DocumentTabSession, 'pdfFile' | 'pageTexts' | 'pageHeadings' | 'documentOutline'>;
+
+// Key for per-document data: the file hash, or the tab id for a file
+// without one. The same PDF open twice shares its index and vectors.
+export function documentKey(tab: TabLike, tabId: string): string {
+  return tab.pdfFile.fingerprint || tabId;
+}
+
+// The search index of a tab's document, rebuilt only when its text changes.
+export function tabDocumentIndex(tab: TabLike, tabId: string): DocumentIndex {
+  return getDocumentIndex({
+    key: documentKey(tab, tabId),
+    name: tab.pdfFile.name,
+    pageTexts: tab.pageTexts,
+    headings: tab.pageHeadings,
+    outline: tab.documentOutline,
+  });
+}
+
+// ─── Meaning-based search ───
+
+const VECTOR_CACHE_VERSION = 1;
+
+interface CachedVectors {
+  version: number;
+  model: string;
+  check: string;
+  passageOf: number[];
+  vectors: string;
+}
+
+// FNV-1a hash of the window texts. Cached vectors are used only when the
+// windows they were computed from are identical.
+function textCheck(texts: string[]): string {
+  let hash = 0x811c9dc5;
+  for (const text of texts) {
+    for (let index = 0; index < text.length; index++) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    hash ^= 0x0a;
+  }
+  return `${texts.length}:${(hash >>> 0).toString(16)}`;
+}
+
+let vectorJob: Promise<void> | null = null;
+let vectorRerun = false;
+
+// Computes passage vectors for every tab whose text is ready, active tab
+// first. Runs one document at a time and starts again if tabs changed.
+function scheduleVectors(): void {
+  const state = useStore.getState();
+  if (!state.settings.semanticSearch || !['ready', 'indexing'].includes(state.embeddingStatus)) return;
+  if (vectorJob) {
+    vectorRerun = true;
+    return;
+  }
+  vectorJob = (async () => {
+    const tabs: Array<[string, TabLike]> = [];
+    const current = useStore.getState();
+    if (current.activeDocumentTabId && current.pdfFile && current.documentTextReady) {
+      tabs.push([current.activeDocumentTabId, current as unknown as TabLike]);
+    }
+    for (const tab of current.documentTabs) {
+      if (tab.id !== current.activeDocumentTabId && tab.documentTextReady) tabs.push([tab.id, tab]);
+    }
+    for (const [tabId, tab] of tabs) {
+      const key = documentKey(tab, tabId);
+      const index = tabDocumentIndex(tab, tabId);
+      const windows = embeddingWindows(index);
+      const check = textCheck(windows.texts);
+      if (documentVectors.get(key)?.check === check) continue;
+
+      const cached = /^[a-f0-9]{64}$/i.test(key) ? await loadLibrary<CachedVectors>('embeddings', key) : null;
+      if (cached?.version === VECTOR_CACHE_VERSION && cached.model === EMBEDDING_MODEL_ID && cached.check === check) {
+        documentVectors.set(key, { check, vectors: vectorsFromBase64(cached.vectors), passageOf: cached.passageOf });
+        continue;
+      }
+
+      const parts: Float32Array[] = [];
+      for (let start = 0; start < windows.texts.length; start += 8) {
+        if (!useStore.getState().settings.semanticSearch) return;
+        useStore.getState().setEmbeddingState(
+          'indexing',
+          `preparing ${tab.pdfFile.name} (${Math.round((start / windows.texts.length) * 100)}%)`
+        );
+        parts.push(await embedTexts(windows.texts.slice(start, start + 8)));
+      }
+      const vectors = new Float32Array(parts.reduce((total, part) => total + part.length, 0));
+      let offset = 0;
+      for (const part of parts) {
+        vectors.set(part, offset);
+        offset += part.length;
+      }
+      documentVectors.set(key, { check, vectors, passageOf: windows.passageOf });
+      if (/^[a-f0-9]{64}$/i.test(key)) {
+        void saveLibrary('embeddings', key, {
+          version: VECTOR_CACHE_VERSION,
+          model: EMBEDDING_MODEL_ID,
+          check,
+          passageOf: windows.passageOf,
+          vectors: vectorsToBase64(vectors),
+        } satisfies CachedVectors);
+      }
+    }
+  })()
+    .catch((error) => {
+      console.error('Preparing meaning-based search failed:', error);
+      useStore.getState().setEmbeddingState('error', error instanceof Error ? error.message : String(error));
+    })
+    .finally(() => {
+      vectorJob = null;
+      if (useStore.getState().embeddingStatus === 'indexing') useStore.getState().setEmbeddingState('ready');
+      if (vectorRerun) {
+        vectorRerun = false;
+        scheduleVectors();
+      }
+    });
+}
+
+async function startEmbedder(): Promise<void> {
+  const { setEmbeddingState } = useStore.getState();
+  try {
+    setEmbeddingState('loading');
+    await loadEmbedder();
+    setEmbeddingState('ready');
+    scheduleVectors();
+  } catch (error) {
+    setEmbeddingState('error', error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Downloads the model on the user's request (first use), then loads it.
+export function startEmbeddingDownload(): void {
+  const { setEmbeddingState } = useStore.getState();
+  setEmbeddingState('downloading', 'downloading model (0%)');
+  void downloadEmbeddingModel((fraction) => {
+    setEmbeddingState('downloading', `downloading model (${Math.round(fraction * 100)}%)`);
+  })
+    .then(startEmbedder)
+    .catch((error) => setEmbeddingState('error', error instanceof Error ? error.message : String(error)));
+}
+
 // Picks the next tab to extract: the active one if it still needs text,
 // otherwise the first open tab that does.
 function nextTab(): string | null {
@@ -160,9 +318,32 @@ export default function DocumentIndexer() {
     ...state.documentTabs.map((tab) => `${tab.id}:${tab.id === state.activeDocumentTabId || tab.documentTextReady}`),
   ]));
 
+  const semanticSearch = useStore((state) => state.settings.semanticSearch);
+
   useEffect(() => {
     schedule();
+    scheduleVectors();
   }, [signature]);
+
+  // Load the embedding model at start if it is installed. It is downloaded
+  // only when the user asks (see startEmbeddingDownload).
+  useEffect(() => {
+    if (!semanticSearch) return;
+    const { embeddingStatus, setEmbeddingState } = useStore.getState();
+    if (embeddingStatus === 'ready') {
+      scheduleVectors();
+      return;
+    }
+    if (embeddingStatus !== 'unknown' && embeddingStatus !== 'not-installed' && embeddingStatus !== 'unavailable') return;
+    if (!window.electronAPI) {
+      setEmbeddingState('unavailable');
+      return;
+    }
+    void embeddingInstalled().then((installed) => {
+      if (installed) void startEmbedder();
+      else setEmbeddingState('not-installed');
+    });
+  }, [semanticSearch]);
 
   useEffect(() => () => {
     running?.abort.abort();

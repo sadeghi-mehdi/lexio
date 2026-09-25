@@ -23,7 +23,9 @@ import {
   chunkDocument,
   groupTextsWithinBudget,
 } from '../utils/document-context';
-import { retrieveDigestContext } from '../utils/document-digest';
+import { retrieveContext } from '../utils/retrieval';
+import { documentVectors, embedQuery } from '../utils/embedding-client';
+import { documentKey, tabDocumentIndex } from './DocumentIndexer';
 import { requestProviderText } from '../utils/provider-request';
 import { requestBudget } from '../utils/context-budget';
 import {
@@ -124,9 +126,6 @@ export default function AISidebar() {
     extractedPageCount,
     documentTextReady,
     numPages,
-    digestStatus,
-    digestProgress,
-    digestError,
     sidebarTab,
     settings,
     newConversation,
@@ -138,9 +137,6 @@ export default function AISidebar() {
     clearSelectedTextForAI,
     setSidebarTab,
     setActiveProvider,
-    rebuildDocumentDigest,
-    cancelDocumentDigest,
-    approveDocumentDigest,
   } = useStore(useShallow((state) => ({
     conversations: state.conversations,
     activeConversation: state.activeConversation,
@@ -154,9 +150,6 @@ export default function AISidebar() {
     extractedPageCount: state.extractedPageCount,
     documentTextReady: state.documentTextReady,
     numPages: state.numPages,
-    digestStatus: state.digestStatus,
-    digestProgress: state.digestProgress,
-    digestError: state.digestError,
     sidebarTab: state.sidebarTab,
     settings: state.settings,
     newConversation: state.newConversation,
@@ -168,9 +161,6 @@ export default function AISidebar() {
     clearSelectedTextForAI: state.clearSelectedTextForAI,
     setSidebarTab: state.setSidebarTab,
     setActiveProvider: state.setActiveProvider,
-    rebuildDocumentDigest: state.rebuildDocumentDigest,
-    cancelDocumentDigest: state.cancelDocumentDigest,
-    approveDocumentDigest: state.approveDocumentDigest,
   })));
 
   const [input, setInput] = useState('');
@@ -326,21 +316,22 @@ export default function AISidebar() {
           });
         }
       } else {
-        const completeContext = buildDocumentContext({
-          pageTexts: state.pageTexts,
-          mode: 'entire',
-          query: text,
-          maxChars: maxContextChars,
+        // The chat still belongs to one tab here; searching several PDFs at
+        // once uses the same retrieval with more documents in scope.
+        const key = documentKey(state as never, requestTabId);
+        const vectors = documentVectors.get(key);
+        const retrieval = retrieveContext({
+          documents: [{
+            label: 'D1',
+            index: tabDocumentIndex(state as never, requestTabId),
+            vectors: vectors?.vectors,
+            windowPassages: vectors?.passageOf,
+          }],
+          question: text,
+          budgetTokens: budget.documentTokens,
+          queryVector: await embedQuery(text),
         });
-        const strategy = chooseDocumentAwareStrategy(
-          text,
-          completeContext.requiresHierarchicalSummary,
-          Boolean(state.documentDigest)
-        );
-        if (strategy === 'entire-original') {
-          contextText = completeContext.text;
-          contextDescription = `the complete original text of the ${completeContext.pages.length}-page document`;
-        } else if (strategy === 'hierarchical-summary') {
+        if (retrieval.wholeDocumentRequest) {
           contextDescription = `complete hierarchical summaries of the entire ${state.pageTexts.size}-page document`;
           contextText = await summarizeDocumentHierarchically({
             pageTexts: state.pageTexts,
@@ -354,26 +345,9 @@ export default function AISidebar() {
               updateLastAssistantMessage(convId!, status, requestTabId);
             },
           });
-        } else if (strategy === 'indexed-retrieval' && state.documentDigest) {
-          const digest = state.documentDigest;
-          const retrieval = retrieveDigestContext({
-            digest,
-            pageTexts: state.pageTexts,
-            query: text,
-            maxChars: maxContextChars,
-            maxRanges: settings.maxRetrievedRanges,
-          });
+        } else {
           contextText = retrieval.text;
           contextDescription = retrieval.description;
-        } else {
-          const fallback = buildDocumentContext({
-            pageTexts: state.pageTexts,
-            mode: 'relevant',
-            query: text,
-            maxChars: maxContextChars,
-          });
-          contextText = fallback.text;
-          contextDescription = `${fallback.description} selected directly from the original PDF while the page index is unavailable`;
         }
       }
 
@@ -425,7 +399,6 @@ export default function AISidebar() {
     settings.activeProvider,
     settings.contextMode,
     settings.maxContextChars,
-    settings.maxRetrievedRanges,
     settings.customInstructions,
     activeProviderConfig,
     selectedTextForAI,
@@ -596,30 +569,6 @@ export default function AISidebar() {
             {hasPdf && settings.contextMode === 'rawEntire' && !documentTextReady && !selectedTextForAI && (
               <div className="mb-2 rounded-lg border border-accent/20 bg-accent/5 px-2.5 py-2 text-[11px] text-accent-light">
                 Extracting PDF text… {extractedPageCount} / {numPages || '…'} pages.
-              </div>
-            )}
-            {hasPdf && settings.contextMode === 'documentAware' && !selectedTextForAI && digestStatus !== 'ready' && (
-              <div className={`mb-2 rounded-lg border px-2.5 py-2 text-[11px] ${
-                digestStatus === 'error'
-                  ? 'border-red-500/30 bg-red-500/5 text-red-300'
-                  : 'border-accent/20 bg-accent/5 text-accent-light'
-              }`}>
-                <div>{digestError || digestProgress || 'Preparing reusable document digest…'}</div>
-                {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
-                  <button onClick={cancelDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Cancel digest generation
-                  </button>
-                )}
-                {digestStatus === 'needs-approval' && (
-                  <button onClick={approveDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Build page index
-                  </button>
-                )}
-                {(digestStatus === 'error' || digestStatus === 'cancelled') && (
-                  <button onClick={rebuildDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Build digest again
-                  </button>
-                )}
               </div>
             )}
             {/* Selected text context card */}
@@ -804,8 +753,8 @@ function EmptyChat() {
       </div>
       <p className="text-sm text-text-secondary font-medium mb-1">Ask about your document</p>
       <p className="text-xs text-text-muted leading-relaxed">
-        Select text and click "Ask AI", or type a question below. Document-aware mode reuses the
-        cached digest to find and send original source page ranges.
+        Select text and click "Ask AI", or type a question below. Short PDFs are sent whole;
+        for long ones Lexio finds the relevant passages and cites their pages.
       </p>
     </div>
   );

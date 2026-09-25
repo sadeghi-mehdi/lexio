@@ -13,12 +13,13 @@ interface ElectronAPI {
   loadSettings: () => Promise<unknown>;
   saveSettings: (settings: AppSettings) => Promise<void>;
   credentialStatus: () => Promise<{ persistent: boolean; weak: boolean }>;
-  loadDigest: (fingerprint: string) => Promise<unknown>;
-  saveDigest: (fingerprint: string, digest: DocumentDigest) => Promise<void>;
-  deleteDigest: (fingerprint: string) => Promise<void>;
   loadLibrary: (kind: LibraryKind, key: string) => Promise<unknown>;
   saveLibrary: (kind: LibraryKind, key: string, data: unknown) => Promise<void>;
   deleteLibrary: (kind: LibraryKind, key: string) => Promise<void>;
+  embeddingStatus: () => Promise<{ installed: boolean; downloading: boolean }>;
+  downloadEmbeddingModel: () => Promise<void>;
+  loadEmbeddingModel: () => Promise<{ model: Uint8Array; tokenizer: string } | null>;
+  onEmbeddingProgress: (cb: (progress: { file: string; received: number; total: number }) => void) => Unsubscribe;
   onPdfOpened: (cb: (data: PdfFileData) => void) => Unsubscribe;
   onToggleSidebar: (cb: () => void) => Unsubscribe;
   onZoomIn: (cb: () => void) => Unsubscribe;
@@ -130,53 +131,8 @@ export interface PageRange {
   endPage: number;
 }
 
-export interface DigestSection extends PageRange {
-  id: string;
-  title: string;
-  summary: string;
-  keywords: string[];
-  entities: string[];
-  sectionType: 'chapter' | 'appendix' | 'references' | 'body' | 'other';
-}
-
-export interface DigestTopic {
-  name: string;
-  description: string;
-  pageRanges: PageRange[];
-}
-
-export interface DigestPageEntry {
-  pageNumber: number;
-  headings: string[];
-  sectionTitle: string;
-  keywords: string[];
-  description: string;
-}
-
-export interface DocumentDigest {
-  version: number;
-  documentFingerprint: string;
-  documentName: string;
-  pageCount: number;
-  generatedAt: number;
-  providerId: AIProvider;
-  model: string;
-  overview: string;
-  majorTopics: DigestTopic[];
-  sections: DigestSection[];
-  pages: DigestPageEntry[];
-}
-
-export type DigestStatus =
-  | 'idle'
-  | 'extracting'
-  | 'loading'
-  | 'generating'
-  | 'consolidating'
-  | 'ready'
-  | 'error'
-  | 'cancelled'
-  | 'needs-approval';
+// Text extraction state of a document tab.
+export type IndexStatus = 'idle' | 'extracting' | 'ready';
 
 // ─── Settings ───
 
@@ -189,14 +145,8 @@ export interface AppSettings {
   contextMode: ContextMode;
   maxContextChars: number;
   customInstructions: string;
-  digestEnabled: boolean;
-  // When false, building the page index with a cloud provider waits for the
-  // user to approve sending the document text.
-  digestAutoCloud: boolean;
-  digestProvider: 'active' | AIProvider;
-  digestModels: Record<AIProvider, string>;
-  digestChunkChars: number;
-  maxRetrievedRanges: number;
+  // Meaning-based search with a local embedding model, downloaded on first use.
+  semanticSearch: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -252,16 +202,5 @@ export const DEFAULT_SETTINGS: AppSettings = {
   contextMode: 'documentAware',
   maxContextChars: 100000,
   customInstructions: '',
-  digestEnabled: true,
-  digestAutoCloud: false,
-  digestProvider: 'active',
-  digestModels: {
-    ollama: '',
-    claude: '',
-    openai: '',
-    openaiCompatible: '',
-    gemini: '',
-  },
-  digestChunkChars: 60000,
-  maxRetrievedRanges: 4,
+  semanticSearch: true,
 };

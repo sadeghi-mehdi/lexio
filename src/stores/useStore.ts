@@ -10,8 +10,7 @@ import type {
   HighlightColor,
   AnnotationType,
   RelativeRect,
-  DocumentDigest,
-  DigestStatus,
+  IndexStatus,
 } from '../types.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
 import { abortChatRequest } from '../utils/chat-request-registry.ts';
@@ -19,6 +18,16 @@ import { releaseRegisteredDocument } from '../utils/pdf-document-registry.ts';
 import type { OutlineEntry } from '../utils/text-index.ts';
 
 export type ToolType = 'select' | AnnotationType | 'comment';
+
+export type EmbeddingStatus =
+  | 'unknown'
+  | 'unavailable'
+  | 'not-installed'
+  | 'downloading'
+  | 'loading'
+  | 'indexing'
+  | 'ready'
+  | 'error';
 
 // Undo/Redo action types
 type UndoAction =
@@ -51,14 +60,8 @@ export interface DocumentTabSession {
   selectedPageForAI: number;
   selectedEndPageForAI: number;
   selectedRectsForAI: RelativeRect[];
-  documentFingerprint: string;
-  documentDigest: DocumentDigest | null;
-  digestStatus: DigestStatus;
-  digestProgress: string;
-  digestError: string;
-  digestRebuildToken: number;
-  digestCancelToken: number;
-  digestApproved: boolean;
+  indexStatus: IndexStatus;
+  indexProgress: string;
 }
 
 interface AppState {
@@ -95,14 +98,12 @@ interface AppState {
   selectedPageForAI: number;
   selectedEndPageForAI: number;
   selectedRectsForAI: RelativeRect[];
-  documentFingerprint: string;
-  documentDigest: DocumentDigest | null;
-  digestStatus: DigestStatus;
-  digestProgress: string;
-  digestError: string;
-  digestRebuildToken: number;
-  digestCancelToken: number;
-  digestApproved: boolean;
+  indexStatus: IndexStatus;
+  indexProgress: string;
+
+  // Meaning-based search (embedding model and document vectors)
+  embeddingStatus: EmbeddingStatus;
+  embeddingProgress: string;
 
   // UI
   sidebarOpen: boolean;
@@ -127,12 +128,7 @@ interface AppState {
   ) => void;
   setExtractionProgress: (pageCount: number, complete?: boolean, tabId?: string | null) => void;
   setDocumentOutline: (outline: OutlineEntry[], tabId?: string | null) => void;
-  setDocumentFingerprint: (fingerprint: string) => void;
-  setDocumentDigest: (digest: DocumentDigest | null) => void;
-  setDigestState: (status: DigestStatus, progress?: string, error?: string) => void;
-  rebuildDocumentDigest: () => void;
-  cancelDocumentDigest: () => void;
-  approveDocumentDigest: () => void;
+  setEmbeddingState: (status: EmbeddingStatus, progress?: string) => void;
   setNumPages: (n: number) => void;
   setCurrentPage: (p: number) => void;
   setZoom: (z: number) => void;
@@ -189,7 +185,6 @@ function documentIdentity(file: PdfFileData): string {
 
 function captureActiveSession(state: AppState): DocumentTabSession | null {
   if (!state.pdfFile || !state.activeDocumentTabId) return null;
-  const indexWasRunning = ['extracting', 'loading', 'generating', 'consolidating'].includes(state.digestStatus);
   return {
     id: state.activeDocumentTabId,
     identity: documentIdentity(state.pdfFile),
@@ -215,14 +210,8 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     selectedPageForAI: state.selectedPageForAI,
     selectedEndPageForAI: state.selectedEndPageForAI,
     selectedRectsForAI: state.selectedRectsForAI,
-    documentFingerprint: state.documentFingerprint,
-    documentDigest: state.documentDigest,
-    digestStatus: indexWasRunning ? 'idle' : state.digestStatus,
-    digestProgress: indexWasRunning ? 'Paused — activate this tab to continue' : state.digestProgress,
-    digestError: state.digestError,
-    digestRebuildToken: state.digestRebuildToken,
-    digestCancelToken: state.digestCancelToken,
-    digestApproved: state.digestApproved,
+    indexStatus: state.indexStatus,
+    indexProgress: state.indexProgress,
   };
 }
 
@@ -252,14 +241,8 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     selectedPageForAI: 0,
     selectedEndPageForAI: 0,
     selectedRectsForAI: [],
-    documentFingerprint: '',
-    documentDigest: null,
-    digestStatus: 'extracting',
-    digestProgress: 'Extracting PDF text…',
-    digestError: '',
-    digestRebuildToken: 0,
-    digestCancelToken: 0,
-    digestApproved: false,
+    indexStatus: 'extracting',
+    indexProgress: 'Extracting PDF text…',
   };
 }
 
@@ -289,14 +272,8 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     selectedPageForAI: session.selectedPageForAI,
     selectedEndPageForAI: session.selectedEndPageForAI,
     selectedRectsForAI: session.selectedRectsForAI,
-    documentFingerprint: session.documentFingerprint,
-    documentDigest: session.documentDigest,
-    digestStatus: session.digestStatus,
-    digestProgress: session.digestProgress,
-    digestError: session.digestError,
-    digestRebuildToken: session.digestRebuildToken,
-    digestCancelToken: session.digestCancelToken,
-    digestApproved: session.digestApproved,
+    indexStatus: session.indexStatus,
+    indexProgress: session.indexProgress,
   };
 }
 
@@ -350,14 +327,11 @@ export const useStore = create<AppState>((set, get) => ({
   selectedPageForAI: 0,
   selectedEndPageForAI: 0,
   selectedRectsForAI: [],
-  documentFingerprint: '',
-  documentDigest: null,
-  digestStatus: 'idle',
-  digestProgress: '',
-  digestError: '',
-  digestRebuildToken: 0,
-  digestCancelToken: 0,
-  digestApproved: false,
+  indexStatus: 'idle',
+  indexProgress: '',
+
+  embeddingStatus: 'unknown',
+  embeddingProgress: '',
 
   sidebarOpen: true,
   sidebarWidth: 700,
@@ -414,12 +388,8 @@ export const useStore = create<AppState>((set, get) => ({
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
         selectedRectsForAI: [],
-        documentFingerprint: '',
-        documentDigest: null,
-        digestStatus: 'idle',
-        digestProgress: '',
-        digestError: '',
-        digestApproved: false,
+        indexStatus: 'idle',
+        indexProgress: '',
       };
     }
     const identity = documentIdentity(file);
@@ -493,12 +463,8 @@ export const useStore = create<AppState>((set, get) => ({
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
         selectedRectsForAI: [],
-        documentFingerprint: '',
-        documentDigest: null,
-        digestStatus: 'idle',
-        digestProgress: '',
-        digestError: '',
-        digestApproved: false,
+        indexStatus: 'idle',
+        indexProgress: '',
       };
     });
   },
@@ -517,33 +483,14 @@ export const useStore = create<AppState>((set, get) => ({
     set((s) => patchTab(s, tabId, () => ({
       extractedPageCount,
       documentTextReady,
-      digestStatus: documentTextReady ? 'idle' : 'extracting',
-      digestProgress: documentTextReady
+      indexStatus: documentTextReady ? 'ready' : 'extracting',
+      indexProgress: documentTextReady
         ? 'PDF text extraction complete'
         : `Extracting PDF text — page ${extractedPageCount}`,
     }))),
   setDocumentOutline: (documentOutline, tabId) =>
     set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
-  setDocumentFingerprint: (documentFingerprint) => set({ documentFingerprint }),
-  setDocumentDigest: (documentDigest) => set({ documentDigest }),
-  setDigestState: (digestStatus, digestProgress = '', digestError = '') => set({
-    digestStatus,
-    digestProgress,
-    digestError,
-  }),
-  rebuildDocumentDigest: () => set((state) => ({
-    documentDigest: null,
-    digestError: '',
-    digestStatus: state.documentTextReady ? 'loading' : 'extracting',
-    digestProgress: 'Rebuilding document digest…',
-    digestRebuildToken: state.digestRebuildToken + 1,
-  })),
-  approveDocumentDigest: () => set({ digestApproved: true }),
-  cancelDocumentDigest: () => set((state) => ({
-    digestStatus: 'cancelled',
-    digestProgress: 'Document digest generation cancelled',
-    digestCancelToken: state.digestCancelToken + 1,
-  })),
+  setEmbeddingState: (embeddingStatus, embeddingProgress = '') => set({ embeddingStatus, embeddingProgress }),
   setNumPages: (n) => set({ numPages: n }),
   setCurrentPage: (p) => set({ currentPage: p }),
   setZoom: (z) => set({ zoom: Math.max(0.25, Math.min(5, z)) }),

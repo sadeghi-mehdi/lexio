@@ -150,7 +150,9 @@ export const questions = [
   { q: 'Which F1 score and which crack sealing interval are mentioned?', scope: ['paper', 'report'], mustInclude: [['paper', 5], ['report', 95]], kind: 'multi' },
   { q: 'How were cracks measured in the study and in the report?', scope: ['paper', 'report'], anyOf: [['paper', 3], ['paper', 5], ['report', 81]], kind: 'multi' },
   { q: 'What mixture had 4.1 mm rut depth?', scope: ['paper', 'report', 'tables'], mustInclude: [['tables', 6]], kind: 'multi' },
-  { q: 'What is the total repair cost in the Japanese report?', scope: ['report', 'ja'], mustInclude: [['ja', 4]], kind: 'multi' },
+  // Asked in English about a Japanese document. Neither keyword search nor an
+  // English embedding model can bridge languages; kept to show the limit.
+  { q: 'What is the total repair cost in the Japanese report?', scope: ['report', 'ja'], mustInclude: [['ja', 4]], kind: 'crosslingual' },
   { q: 'What calibration is described for the deflectometer and what camera was used?', scope: ['paper', 'report'], mustInclude: [['report', 64], ['paper', 3]], kind: 'multi' },
 ];
 

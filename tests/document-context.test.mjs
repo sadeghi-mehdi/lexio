@@ -75,6 +75,7 @@ test('detects explicit whole-document summary requests', () => {
   assert.equal(isWholeDocumentRequest('Summarize this document'), true);
   assert.equal(isWholeDocumentRequest('Review the literature and identify research gaps.'), true);
   assert.equal(isWholeDocumentRequest('What does the rutting result mean?'), false);
+  assert.equal(isWholeDocumentRequest('What does the literature review section say about cracks?'), false);
 });
 
 test('adds custom instructions to the system prompt', () => {

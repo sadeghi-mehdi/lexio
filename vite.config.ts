@@ -8,11 +8,13 @@ import fs from 'fs';
 // Content-Security-Policy for built pages. Scripts, workers and fonts load only
 // from the app itself, so a malicious PDF or model answer cannot pull in code.
 // connect-src must stay open to http(s) because users configure their own AI
-// endpoints (including Ollama on another machine). The development server is
-// left without a CSP because Vite injects inline scripts for hot reload.
+// endpoints (including Ollama on another machine). 'wasm-unsafe-eval' lets the
+// bundled embedding runtime compile its WebAssembly; it does not allow eval or
+// scripts from anywhere else. The development server is left without a CSP
+// because Vite injects inline scripts for hot reload.
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -44,6 +46,12 @@ const pdfjsAssetsAndCsp: Plugin = {
         { recursive: true }
       );
     }
+    // The embedding runtime loads this file at run time (see embedding-client.ts).
+    fs.mkdirSync(path.join(outDir, 'ort'), { recursive: true });
+    fs.copyFileSync(
+      path.resolve(__dirname, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm'),
+      path.join(outDir, 'ort', 'ort-wasm-simd-threaded.wasm')
+    );
   },
 };
 
@@ -86,6 +94,9 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['pdfjs-dist'],
+    exclude: ['pdfjs-dist', 'onnxruntime-web'],
+  },
+  worker: {
+    format: 'es',
   },
 });

@@ -91,30 +91,6 @@ export function normalizeSettings(raw: unknown): AppSettings {
     activeProvider = 'openaiCompatible';
   }
 
-  const rawDigestProvider = source.digestProvider === 'active' || PROVIDER_IDS.includes(source.digestProvider as AIProvider)
-    ? (source.digestProvider as 'active' | AIProvider)
-    : DEFAULT_SETTINGS.digestProvider;
-  const effectiveLegacyDigestProvider = rawDigestProvider === 'active'
-    ? activeProvider
-    : rawDigestProvider;
-  const rawDigestModels = isRecord(source.digestModels) ? source.digestModels : {};
-  const digestModels = Object.fromEntries(PROVIDER_IDS.map((id) => {
-    let model = typeof rawDigestModels[id] === 'string'
-      ? (rawDigestModels[id] as string).slice(0, 200)
-      : '';
-    if (
-      !model &&
-      id === effectiveLegacyDigestProvider &&
-      typeof source.digestModel === 'string'
-    ) {
-      model = source.digestModel.slice(0, 200);
-    }
-    if (id !== 'openaiCompatible' && GENERIC_OPENAI_ONLY_MODELS.has(model.toLowerCase())) {
-      model = '';
-    }
-    return [id, model];
-  })) as Record<AIProvider, string>;
-
   const legacyContextMode = typeof source.contextMode === 'string' ? source.contextMode : '';
   const rawContextMode = legacyContextMode === 'entire'
     ? 'rawEntire'
@@ -147,27 +123,7 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof source.customInstructions === 'string'
         ? source.customInstructions.slice(0, 20000)
         : DEFAULT_SETTINGS.customInstructions,
-    digestEnabled:
-      typeof source.digestEnabled === 'boolean'
-        ? source.digestEnabled
-        : DEFAULT_SETTINGS.digestEnabled,
-    digestAutoCloud:
-      typeof source.digestAutoCloud === 'boolean'
-        ? source.digestAutoCloud
-        : DEFAULT_SETTINGS.digestAutoCloud,
-    digestProvider: rawDigestProvider,
-    digestModels,
-    digestChunkChars: clampInteger(
-      source.digestChunkChars,
-      DEFAULT_SETTINGS.digestChunkChars,
-      10000,
-      200000
-    ),
-    maxRetrievedRanges: clampInteger(
-      source.maxRetrievedRanges,
-      DEFAULT_SETTINGS.maxRetrievedRanges,
-      1,
-      10
-    ),
+    semanticSearch:
+      typeof source.semanticSearch === 'boolean' ? source.semanticSearch : DEFAULT_SETTINGS.semanticSearch,
   };
 }

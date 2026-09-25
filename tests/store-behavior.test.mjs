@@ -47,18 +47,7 @@ test('opening a document clears the previous document session', () => {
     isStreaming: true,
     extractedPageCount: 203,
     documentTextReady: true,
-    documentDigest: {
-      version: 1,
-      documentFingerprint: 'a'.repeat(64),
-      documentName: 'old.pdf',
-      pageCount: 10,
-      generatedAt: 1,
-      providerId: 'ollama',
-      model: 'test',
-      overview: 'old',
-      majorTopics: [],
-      sections: [],
-    },
+    documentOutline: [{ title: 'Old', page: 1, depth: 0 }],
   });
 
   useStore.getState().setPdfFile(pdf('new.pdf'));
@@ -69,7 +58,7 @@ test('opening a document clears the previous document session', () => {
   assert.equal(state.isStreaming, false);
   assert.equal(state.extractedPageCount, 0);
   assert.equal(state.documentTextReady, false);
-  assert.equal(state.documentDigest, null);
+  assert.deepEqual(state.documentOutline, []);
 });
 
 test('extracted page text is merged in batches without losing earlier pages', () => {
@@ -83,17 +72,6 @@ test('extracted page text is merged in batches without losing earlier pages', ()
   assert.notEqual(state.pageTexts, firstMap);
   useStore.getState().mergePageTexts([]);
   assert.equal(useStore.getState().pageTexts, state.pageTexts);
-});
-
-test('page-index approval is remembered per document tab', () => {
-  useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile(pdf('approved.pdf'));
-  const approvedTab = useStore.getState().activeDocumentTabId;
-  useStore.getState().approveDocumentDigest();
-  useStore.getState().setPdfFile(pdf('other.pdf'));
-  assert.equal(useStore.getState().digestApproved, false);
-  useStore.getState().switchDocumentTab(approvedTab);
-  assert.equal(useStore.getState().digestApproved, true);
 });
 
 test('closing a tab releases its parsed PDF document', async () => {
@@ -116,26 +94,14 @@ test('document tabs preserve independent viewer, chat, and page-index state', ()
   useStore.getState().addMessage(conversationA, {
     id: 'a-message', role: 'user', content: 'Question for A', timestamp: 1,
   });
-  useStore.getState().setDocumentDigest({
-    version: 2,
-    documentFingerprint: 'a'.repeat(64),
-    documentName: 'A.pdf',
-    pageCount: 20,
-    generatedAt: 1,
-    providerId: 'openaiCompatible',
-    model: 'index-model-a',
-    overview: 'A index',
-    majorTopics: [],
-    sections: [],
-    pages: [],
-  });
+  useStore.getState().setDocumentOutline([{ title: 'A outline', page: 1, depth: 0 }]);
 
   useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
   assert.notEqual(tabA, tabB);
   assert.equal(useStore.getState().currentPage, 1);
   assert.deepEqual(useStore.getState().conversations, []);
-  assert.equal(useStore.getState().documentDigest, null);
+  assert.deepEqual(useStore.getState().documentOutline, []);
 
   useStore.getState().setCurrentPage(4);
   const conversationB = useStore.getState().newConversation();
@@ -147,7 +113,7 @@ test('document tabs preserve independent viewer, chat, and page-index state', ()
   assert.equal(useStore.getState().pdfFile.name, 'A.pdf');
   assert.equal(useStore.getState().currentPage, 17);
   assert.equal(useStore.getState().conversations[0].messages[0].content, 'Question for A');
-  assert.equal(useStore.getState().documentDigest.model, 'index-model-a');
+  assert.equal(useStore.getState().documentOutline[0].title, 'A outline');
 
   useStore.getState().switchDocumentTab(tabB);
   assert.equal(useStore.getState().pdfFile.name, 'B.pdf');

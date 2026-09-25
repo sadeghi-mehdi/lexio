@@ -17,12 +17,20 @@ test('table, figure and appendix references become exact tokens', () => {
 
 test('numbers, short acronyms and decimals are kept', () => {
   const tokens = tokenize('The AI model reached an F1 of 0.873 on 4,820 images.');
-  for (const token of ['ai', 'f1', '0.873', '4820', 'image']) assert.ok(tokens.includes(token), token);
+  for (const token of ['ai', 'f1', '0.873', '4820']) assert.ok(tokens.includes(token), token);
+  assert.ok(tokens.includes(tokenize('image')[0]));
 });
 
 test('hyphenated words give their parts and the joined form', () => {
   const tokens = tokenize('micro-surfacing');
-  assert.deepEqual(tokens, ['micro', 'surfacing', 'microsurfacing']);
+  assert.deepEqual(tokens, ['micro', tokenize('surfacing')[0], tokenize('microsurfacing')[0]]);
+});
+
+test('plural, -ing and -ed forms meet at one stem', () => {
+  assert.equal(tokenize('rutting')[0], tokenize('rut')[0]);
+  assert.equal(tokenize('cracks')[0], tokenize('cracking')[0]);
+  assert.equal(tokenize('measured')[0], tokenize('measure')[0]);
+  assert.equal(tokenize('studies')[0], tokenize('study')[0]);
 });
 
 test('Chinese and Japanese text is split into two-character pieces', () => {

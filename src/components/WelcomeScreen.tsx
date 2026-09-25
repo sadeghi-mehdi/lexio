@@ -29,8 +29,8 @@ export default function WelcomeScreen() {
         Welcome to Lexio
       </h1>
       <p className="text-sm text-text-secondary max-w-md leading-relaxed mb-8">
-        Open a PDF to start reading, select passages, and build a reusable digest for fast,
-        page-aware AI questions.
+        Open PDFs to start reading, select passages, and ask AI questions that cite the
+        pages they come from.
       </p>
 
       <button

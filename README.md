@@ -268,6 +268,16 @@ Then register it in `DEFAULT_PROVIDERS` in `src/types.ts`.
 
 Lexio follows [Semantic Versioning](https://semver.org/). While the application remains in active pre-1.0 development, backward-compatible feature milestones increment the minor version and bug fixes increment the patch version. Version `1.0.0` is reserved for the first stable release. The entry matching the version in `package.json` is required; the automated test suite checks this, so every future version change must update this catalog before it can pass verification.
 
+### Unreleased: Workspace AI
+
+Document search:
+- Every open PDF is extracted in the background, active tab first, and its text, headings and outline are cached by file hash. The viewer no longer extracts text itself.
+- A new search index splits pages into passages tagged with page and section. Its tokenizer keeps numbers and acronyms, matches "Table 3", "Figure 2" and "Appendix F" exactly, rejoins words hyphenated across lines, and splits Chinese and Japanese text into two-character pieces.
+- Optional meaning-based search with a small English model (all-MiniLM-L6-v2, 23 MB) that runs on your computer. It is downloaded once on request from Hugging Face and checked against a pinned SHA-256. Passages are scored by their best 2-3 sentence window.
+- Questions send the whole PDF when it fits the model; otherwise a weighted blend of keyword and meaning scores picks passages, best first, within the budget. On the generated evaluation set, the right text reached the model for 94% of questions, up from 56%.
+- Context budgets follow each model's context window. Ollama now receives `num_ctx`, and each provider has a context window setting.
+- The LLM-built page index was removed. Indexing no longer sends documents to an AI provider.
+
 ### Unreleased: Security and performance hardening
 
 Security:

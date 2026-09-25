@@ -40,16 +40,8 @@ export default function SettingsPanel() {
   }, []);
   const [activeTab, setActiveTab] = useState<AIProvider>(settings.activeProvider);
   const [showKey, setShowKey] = useState(false);
-  const [customDigestProvider, setCustomDigestProvider] = useState<AIProvider | null>(null);
 
   const provider = settings.providers[activeTab];
-  const effectiveDigestProviderId = settings.digestProvider === 'active'
-    ? settings.activeProvider
-    : settings.digestProvider;
-  const digestModelOverride = settings.digestModels[activeTab] || '';
-  const digestUsesCustomModel = customDigestProvider === activeTab || (
-    Boolean(digestModelOverride) && !provider.models.includes(digestModelOverride)
-  );
 
   const handleSave = () => {
     const normalized = normalizeSettings(settings);
@@ -278,7 +270,7 @@ export default function SettingsPanel() {
               <div>
                 <h3 className="text-sm font-semibold text-text-primary">Document context</h3>
                 <p className="text-xs text-text-muted mt-1">
-                  Ask AI uses only the selected passage. Typed questions use original PDF text selected with the page index, or raw mode below.
+                  Ask AI uses only the selected passage. Typed questions send the whole PDF when it fits the model, and otherwise the most relevant passages of the original text.
                 </p>
               </div>
 
@@ -290,7 +282,7 @@ export default function SettingsPanel() {
                   }
                   className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors"
                 >
-                  <option value="documentAware">Document-aware — page index + original source pages</option>
+                  <option value="documentAware">Document-aware — whole PDF when it fits, else relevant passages</option>
                   <option value="rawEntire">Raw full document — resend or resummarize every request</option>
                 </select>
                 {settings.contextMode === 'rawEntire' && (
@@ -300,130 +292,19 @@ export default function SettingsPanel() {
                 )}
               </SettingField>
 
-              <SettingField label="Reusable page index">
+              <SettingField label="Meaning-based search">
                 <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
                   <input
                     type="checkbox"
-                    checked={settings.digestEnabled}
-                    onChange={(event) => updateSettings({ digestEnabled: event.target.checked })}
+                    checked={settings.semanticSearch}
+                    onChange={(event) => updateSettings({ semanticSearch: event.target.checked })}
                     className="mt-0.5 accent-accent"
                   />
                   <span className="text-xs text-text-secondary">
-                    Build once and cache headings, section titles, descriptions, and up to 20 keywords per page. Answers use original PDF text, not the index.
+                    Also find passages that match the meaning of a question, not only its words, using a small English model (23 MB) that runs on this computer. It is downloaded once when you ask for it in the document index panel. PDF text never leaves your computer for this.
                   </span>
                 </label>
-                {settings.digestEnabled && (
-                  <label className="mt-2 flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
-                    <input
-                      type="checkbox"
-                      checked={settings.digestAutoCloud}
-                      onChange={(event) => updateSettings({ digestAutoCloud: event.target.checked })}
-                      className="mt-0.5 accent-accent"
-                    />
-                    <span className="text-xs text-text-secondary">
-                      Build page indexes with cloud providers without asking. When off, Lexio asks before sending a document's full text to a cloud provider. Local providers never ask.
-                    </span>
-                  </label>
-                )}
               </SettingField>
-
-              {settings.digestEnabled && (
-                <>
-                  <SettingField label={`Page indexing with ${provider.name}`}>
-                    <label className="flex items-center justify-between gap-4 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2.5">
-                      <span className="text-xs text-text-secondary">
-                        Use {provider.name} to build the reusable page index
-                      </span>
-                      <input
-                        type="radio"
-                        name="page-index-provider"
-                        checked={effectiveDigestProviderId === activeTab}
-                        onChange={() => updateSettings({ digestProvider: activeTab })}
-                        className="accent-accent"
-                        aria-label={`Use ${provider.name} for page indexing`}
-                      />
-                    </label>
-                    <p className="mt-1 text-[11px] text-text-muted">
-                      {effectiveDigestProviderId === activeTab
-                        ? `${provider.name} is the current page-index provider.`
-                        : `${settings.providers[effectiveDigestProviderId].name} is currently used. Select this option to switch.`}
-                    </p>
-                  </SettingField>
-
-                  <SettingField label={`${provider.name} page-index model`}>
-                    <div className="flex gap-2">
-                      <select
-                        value={digestUsesCustomModel
-                          ? '__custom__'
-                          : digestModelOverride || '__main__'}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          if (value === '__custom__') {
-                            setCustomDigestProvider(activeTab);
-                            return;
-                          }
-                          setCustomDigestProvider(null);
-                          updateSettings({
-                            digestModels: {
-                              ...settings.digestModels,
-                              [activeTab]: value === '__main__' ? '' : value,
-                            },
-                          });
-                        }}
-                        className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40"
-                      >
-                        <option value="__main__">Use main model — {provider.model}</option>
-                        {provider.models.map((model) => (
-                          <option key={model} value={model}>{model}</option>
-                        ))}
-                        <option value="__custom__">Custom model…</option>
-                      </select>
-                      {digestUsesCustomModel && (
-                        <input
-                          type="text"
-                          autoFocus={customDigestProvider === activeTab}
-                          value={digestModelOverride}
-                          onChange={(event) => updateSettings({
-                            digestModels: {
-                              ...settings.digestModels,
-                              [activeTab]: event.target.value,
-                            },
-                          })}
-                          placeholder="Exact custom model ID"
-                          className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                        />
-                      )}
-                    </div>
-                    <p className="mt-1 text-[11px] text-text-muted">
-                      This list uses {provider.name}'s presets. Choose Custom model to enter another exact model ID. Changes apply when the page index is rebuilt.
-                    </p>
-                  </SettingField>
-
-                  <SettingField label="Page-index chunk characters">
-                    <input
-                      type="number"
-                      min={10000}
-                      max={200000}
-                      step={5000}
-                      value={settings.digestChunkChars}
-                      onChange={(event) => updateSettings({ digestChunkChars: Number(event.target.value) })}
-                      className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                    />
-                  </SettingField>
-
-                  <SettingField label="Maximum retrieved page ranges">
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      value={settings.maxRetrievedRanges}
-                      onChange={(event) => updateSettings({ maxRetrievedRanges: Number(event.target.value) })}
-                      className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                    />
-                  </SettingField>
-
-                </>
-              )}
 
               <SettingField label="Maximum PDF context characters per request">
                 <input

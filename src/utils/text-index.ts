@@ -108,10 +108,20 @@ function stem(word: string): string {
   if (/^method(?:s|ology|ologies|ological)?$/.test(word)) return 'method';
   if (/^procedur(?:e|es|al)$/.test(word)) return 'method';
   if (/^experiment(?:s|al|ation)?$/.test(word)) return 'experiment';
-  if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
-  if (word.length > 4 && /(?:ches|shes|sses|xes)$/.test(word)) return word.slice(0, -2);
-  if (word.length > 3 && word.endsWith('s') && !/(?:ss|us|is)$/.test(word)) return word.slice(0, -1);
-  return word;
+  let stemmed = word;
+  if (stemmed.length > 4 && stemmed.endsWith('ies')) stemmed = `${stemmed.slice(0, -3)}y`;
+  else if (stemmed.length > 4 && /(?:ches|shes|sses|xes)$/.test(stemmed)) stemmed = stemmed.slice(0, -2);
+  else if (stemmed.length > 3 && stemmed.endsWith('s') && !/(?:ss|us|is)$/.test(stemmed)) stemmed = stemmed.slice(0, -1);
+  // -ing and -ed, when a stem with a vowel of at least three letters remains:
+  // "cracking" -> "crack", "rutting" -> "rut" (doubled consonant undone),
+  // "measured" -> "measur".
+  const verb = stemmed.match(/^(.{3,}?)(?:ing|ed)$/);
+  if (verb && /[aeiouy]/.test(verb[1])) {
+    stemmed = /([^aeioulsz])\1$/.test(verb[1]) ? verb[1].slice(0, -1) : verb[1];
+  }
+  // A final "e" is dropped so "measure" and "measured" meet at "measur".
+  if (stemmed.length > 4 && stemmed.endsWith('e')) stemmed = stemmed.slice(0, -1);
+  return stemmed;
 }
 
 // PDF text breaks words at line ends with a hyphen ("rehabili-\ntation").
@@ -218,7 +228,8 @@ export function buildDocumentIndex(options: {
   }
 
   for (const [page, rawText] of sortedPages) {
-    const text = dehyphenate(rawText);
+    // Some PDFs space every word with several blanks; they only cost tokens.
+    const text = dehyphenate(rawText).replace(/[ \t]{2,}/g, ' ');
     pages.set(page, text);
     if (!text.trim()) continue;
 
@@ -287,6 +298,35 @@ export function buildDocumentIndex(options: {
     documentFrequency,
     totalLength,
   };
+}
+
+// Short windows of about two or three sentences for the embedding model.
+// It was trained on short texts, so one relevant sentence in a long passage
+// gets lost in the passage's average; a passage is instead scored by its
+// best window. passageOf[i] is the passage of window i.
+const WINDOW_CHARS = 350;
+
+export function embeddingWindows(index: DocumentIndex): { texts: string[]; passageOf: number[] } {
+  const texts: string[] = [];
+  const passageOf: number[] = [];
+  index.passages.forEach((passage, number) => {
+    const sentences = (passage.text.match(/[\s\S]*?(?:[.!?]+["'”’)\]]*(?=\s)|[。！？]|$)\s*/gu) || [passage.text])
+      .filter((sentence) => sentence.trim().length > 0);
+    let window = '';
+    for (const sentence of sentences) {
+      if (window && window.length + sentence.length > WINDOW_CHARS) {
+        texts.push(window.trim());
+        passageOf.push(number);
+        window = '';
+      }
+      window += sentence;
+    }
+    if (window.trim()) {
+      texts.push(window.trim());
+      passageOf.push(number);
+    }
+  });
+  return { texts, passageOf };
 }
 
 // BM25 over the passages of all given documents, as if they were one
