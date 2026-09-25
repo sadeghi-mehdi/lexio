@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Database, FileText, Plus, RefreshCw, Square, Trash2, X } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
 import { deleteCachedDigest } from '../utils/document-digest';
 
@@ -7,6 +8,7 @@ function statusColor(status: string): string {
   if (status === 'ready') return 'bg-emerald-400';
   if (status === 'error') return 'bg-red-400';
   if (status === 'cancelled' || status === 'idle') return 'bg-text-muted';
+  if (status === 'needs-approval') return 'bg-sky-400';
   return 'bg-amber-300 animate-pulse';
 }
 
@@ -29,7 +31,25 @@ export default function DocumentTabs() {
     setDocumentDigest,
     setDigestState,
     setCurrentPage,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+    documentTabs: state.documentTabs,
+    activeDocumentTabId: state.activeDocumentTabId,
+    digestStatus: state.digestStatus,
+    digestProgress: state.digestProgress,
+    digestError: state.digestError,
+    documentDigest: state.documentDigest,
+    documentFingerprint: state.documentFingerprint,
+    extractedPageCount: state.extractedPageCount,
+    numPages: state.numPages,
+    isStreaming: state.isStreaming,
+    switchDocumentTab: state.switchDocumentTab,
+    closeDocumentTab: state.closeDocumentTab,
+    rebuildDocumentDigest: state.rebuildDocumentDigest,
+    cancelDocumentDigest: state.cancelDocumentDigest,
+    setDocumentDigest: state.setDocumentDigest,
+    setDigestState: state.setDigestState,
+    setCurrentPage: state.setCurrentPage,
+  })));
   const [showIndex, setShowIndex] = useState(false);
 
   useEffect(() => setShowIndex(false), [activeDocumentTabId]);
@@ -113,6 +133,15 @@ export default function DocumentTabs() {
               </div>
             </div>
             <div className="flex gap-1">
+              {digestStatus === 'needs-approval' && (
+                <button
+                  onClick={() => useStore.getState().approveDocumentDigest()}
+                  className="rounded-md px-2 py-1 text-xs text-accent-light hover:bg-surface-3"
+                  title="Send this document to the AI provider and build its page index"
+                >
+                  Build
+                </button>
+              )}
               {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
                 <button onClick={cancelDocumentDigest} className="rounded-md p-1.5 text-text-secondary hover:bg-surface-3" title="Cancel indexing">
                   <Square size={14} />

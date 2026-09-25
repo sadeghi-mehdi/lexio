@@ -15,6 +15,7 @@ import type {
 } from '../types.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
 import { abortChatRequest } from '../utils/chat-request-registry.ts';
+import { releaseRegisteredDocument } from '../utils/pdf-document-registry.ts';
 
 export type ToolType = 'select' | AnnotationType | 'comment';
 
@@ -28,7 +29,6 @@ export interface DocumentTabSession {
   id: string;
   identity: string;
   pdfFile: PdfFileData;
-  pdfText: string;
   pageTexts: Map<number, string>;
   extractedPageCount: number;
   documentTextReady: boolean;
@@ -55,6 +55,7 @@ export interface DocumentTabSession {
   digestError: string;
   digestRebuildToken: number;
   digestCancelToken: number;
+  digestApproved: boolean;
 }
 
 interface AppState {
@@ -64,7 +65,6 @@ interface AppState {
   // PDF
   pdfFile: PdfFileData | null;
   documentSessionId: number;
-  pdfText: string;
   pageTexts: Map<number, string>;
   extractedPageCount: number;
   documentTextReady: boolean;
@@ -97,6 +97,7 @@ interface AppState {
   digestError: string;
   digestRebuildToken: number;
   digestCancelToken: number;
+  digestApproved: boolean;
 
   // UI
   sidebarOpen: boolean;
@@ -112,15 +113,14 @@ interface AppState {
   setPdfFile: (file: PdfFileData | null) => void;
   switchDocumentTab: (id: string) => void;
   closeDocumentTab: (id: string) => void;
-  updateCurrentPdfData: (data: string) => void;
-  setPdfText: (text: string) => void;
-  setPageText: (page: number, text: string) => void;
+  mergePageTexts: (entries: ReadonlyArray<readonly [number, string]>) => void;
   setExtractionProgress: (pageCount: number, complete?: boolean) => void;
   setDocumentFingerprint: (fingerprint: string) => void;
   setDocumentDigest: (digest: DocumentDigest | null) => void;
   setDigestState: (status: DigestStatus, progress?: string, error?: string) => void;
   rebuildDocumentDigest: () => void;
   cancelDocumentDigest: () => void;
+  approveDocumentDigest: () => void;
   setNumPages: (n: number) => void;
   setCurrentPage: (p: number) => void;
   setZoom: (z: number) => void;
@@ -172,7 +172,7 @@ interface AppState {
 const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 
 function documentIdentity(file: PdfFileData): string {
-  return `${file.path.toLowerCase()}::${file.data.length}`;
+  return `${file.id}::${file.data.length}`;
 }
 
 function captureActiveSession(state: AppState): DocumentTabSession | null {
@@ -182,7 +182,6 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     id: state.activeDocumentTabId,
     identity: documentIdentity(state.pdfFile),
     pdfFile: state.pdfFile,
-    pdfText: state.pdfText,
     pageTexts: state.pageTexts,
     extractedPageCount: state.extractedPageCount,
     documentTextReady: state.documentTextReady,
@@ -209,6 +208,7 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     digestError: state.digestError,
     digestRebuildToken: state.digestRebuildToken,
     digestCancelToken: state.digestCancelToken,
+    digestApproved: state.digestApproved,
   };
 }
 
@@ -217,7 +217,6 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     id: uid(),
     identity: documentIdentity(file),
     pdfFile: file,
-    pdfText: '',
     pageTexts: new Map(),
     extractedPageCount: 0,
     documentTextReady: false,
@@ -244,6 +243,7 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     digestError: '',
     digestRebuildToken: 0,
     digestCancelToken: 0,
+    digestApproved: false,
   };
 }
 
@@ -252,7 +252,6 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     activeDocumentTabId: session.id,
     pdfFile: session.pdfFile,
     documentSessionId: nextSessionId,
-    pdfText: session.pdfText,
     pageTexts: session.pageTexts,
     extractedPageCount: session.extractedPageCount,
     documentTextReady: session.documentTextReady,
@@ -279,6 +278,7 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     digestError: session.digestError,
     digestRebuildToken: session.digestRebuildToken,
     digestCancelToken: session.digestCancelToken,
+    digestApproved: session.digestApproved,
   };
 }
 
@@ -290,7 +290,6 @@ export const useStore = create<AppState>((set, get) => ({
 
   pdfFile: null,
   documentSessionId: 0,
-  pdfText: '',
   pageTexts: new Map(),
   extractedPageCount: 0,
   documentTextReady: false,
@@ -319,6 +318,7 @@ export const useStore = create<AppState>((set, get) => ({
   digestError: '',
   digestRebuildToken: 0,
   digestCancelToken: 0,
+  digestApproved: false,
 
   sidebarOpen: true,
   sidebarWidth: 700,
@@ -339,7 +339,12 @@ export const useStore = create<AppState>((set, get) => ({
   // ─── PDF ───
 
   setPdfFile: (file) => {
-    if (!file) get().documentTabs.forEach((tab) => abortChatRequest(tab.id));
+    if (!file) {
+      get().documentTabs.forEach((tab) => {
+        abortChatRequest(tab.id);
+        releaseRegisteredDocument(tab.id);
+      });
+    }
     set((state) => {
     const captured = captureActiveSession(state);
     let documentTabs = captured
@@ -351,7 +356,6 @@ export const useStore = create<AppState>((set, get) => ({
         activeDocumentTabId: null,
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
-        pdfText: '',
         pageTexts: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
@@ -374,6 +378,7 @@ export const useStore = create<AppState>((set, get) => ({
         digestStatus: 'idle',
         digestProgress: '',
         digestError: '',
+        digestApproved: false,
       };
     }
     const identity = documentIdentity(file);
@@ -407,6 +412,7 @@ export const useStore = create<AppState>((set, get) => ({
   }),
   closeDocumentTab: (id) => {
     abortChatRequest(id);
+    releaseRegisteredDocument(id);
     set((state) => {
       const captured = captureActiveSession(state);
       const synchronizedTabs = captured
@@ -428,7 +434,6 @@ export const useStore = create<AppState>((set, get) => ({
         activeDocumentTabId: null,
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
-        pdfText: '',
         pageTexts: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
@@ -450,17 +455,17 @@ export const useStore = create<AppState>((set, get) => ({
         digestStatus: 'idle',
         digestProgress: '',
         digestError: '',
+        digestApproved: false,
       };
     });
   },
-  updateCurrentPdfData: (data) => set((state) => ({
-    pdfFile: state.pdfFile ? { ...state.pdfFile, data } : null,
-  })),
-  setPdfText: (text) => set({ pdfText: text }),
-  setPageText: (page, text) =>
+  // Extraction commits pages in batches. Copying the Map once per batch
+  // instead of once per page keeps extraction linear in the page count.
+  mergePageTexts: (entries) =>
     set((s) => {
+      if (entries.length === 0) return s;
       const newMap = new Map(s.pageTexts);
-      newMap.set(page, text);
+      for (const [page, text] of entries) newMap.set(page, text);
       return { pageTexts: newMap };
     }),
   setExtractionProgress: (extractedPageCount, documentTextReady = false) => set({
@@ -485,6 +490,7 @@ export const useStore = create<AppState>((set, get) => ({
     digestProgress: 'Rebuilding document digest…',
     digestRebuildToken: state.digestRebuildToken + 1,
   })),
+  approveDocumentDigest: () => set({ digestApproved: true }),
   cancelDocumentDigest: () => set((state) => ({
     digestStatus: 'cancelled',
     digestProgress: 'Document digest generation cancelled',

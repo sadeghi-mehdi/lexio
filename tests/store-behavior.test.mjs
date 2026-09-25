@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { useStore } from '../src/stores/useStore.ts';
+import { loadRegisteredDocument } from '../src/utils/pdf-document-registry.ts';
+
+// Store files carry an opaque id and raw bytes, like files from the main process.
+const pdf = (name) => ({ id: name, name, data: new TextEncoder().encode(`%PDF ${name}`) });
 
 const conversation = (id) => ({
   id,
@@ -57,7 +61,7 @@ test('opening a document clears the previous document session', () => {
     },
   });
 
-  useStore.getState().setPdfFile({ path: 'new.pdf', name: 'new.pdf', data: 'bmV3' });
+  useStore.getState().setPdfFile(pdf('new.pdf'));
   const state = useStore.getState();
   assert.deepEqual(state.conversations, []);
   assert.equal(state.activeConversation, null);
@@ -68,22 +72,44 @@ test('opening a document clears the previous document session', () => {
   assert.equal(state.documentDigest, null);
 });
 
-test('updating saved PDF data preserves the current chat session', () => {
-  useStore.setState({
-    pdfFile: { path: 'current.pdf', name: 'current.pdf', data: 'b2xk' },
-    conversations: [conversation('current-document')],
-    activeConversation: 'current-document',
-  });
-  useStore.getState().updateCurrentPdfData('bmV3');
+test('extracted page text is merged in batches without losing earlier pages', () => {
+  useStore.getState().setPdfFile(null);
+  useStore.getState().setPdfFile(pdf('batch.pdf'));
+  useStore.getState().mergePageTexts([[1, 'one'], [2, 'two']]);
+  const firstMap = useStore.getState().pageTexts;
+  useStore.getState().mergePageTexts([[3, 'three']]);
   const state = useStore.getState();
-  assert.equal(state.pdfFile?.data, 'bmV3');
-  assert.equal(state.conversations.length, 1);
-  assert.equal(state.activeConversation, 'current-document');
+  assert.deepEqual([...state.pageTexts.entries()], [[1, 'one'], [2, 'two'], [3, 'three']]);
+  assert.notEqual(state.pageTexts, firstMap);
+  useStore.getState().mergePageTexts([]);
+  assert.equal(useStore.getState().pageTexts, state.pageTexts);
+});
+
+test('page-index approval is remembered per document tab', () => {
+  useStore.getState().setPdfFile(null);
+  useStore.getState().setPdfFile(pdf('approved.pdf'));
+  const approvedTab = useStore.getState().activeDocumentTabId;
+  useStore.getState().approveDocumentDigest();
+  useStore.getState().setPdfFile(pdf('other.pdf'));
+  assert.equal(useStore.getState().digestApproved, false);
+  useStore.getState().switchDocumentTab(approvedTab);
+  assert.equal(useStore.getState().digestApproved, true);
+});
+
+test('closing a tab releases its parsed PDF document', async () => {
+  useStore.getState().setPdfFile(null);
+  useStore.getState().setPdfFile(pdf('release.pdf'));
+  const tabId = useStore.getState().activeDocumentTabId;
+  let destroyed = 0;
+  await loadRegisteredDocument(tabId, async () => ({ destroy: async () => { destroyed++; } }));
+  useStore.getState().closeDocumentTab(tabId);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(destroyed, 1);
 });
 
 test('document tabs preserve independent viewer, chat, and page-index state', () => {
   useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile({ path: 'A.pdf', name: 'A.pdf', data: 'YWFh' });
+  useStore.getState().setPdfFile(pdf('A.pdf'));
   const tabA = useStore.getState().activeDocumentTabId;
   useStore.getState().setCurrentPage(17);
   const conversationA = useStore.getState().newConversation();
@@ -104,7 +130,7 @@ test('document tabs preserve independent viewer, chat, and page-index state', ()
     pages: [],
   });
 
-  useStore.getState().setPdfFile({ path: 'B.pdf', name: 'B.pdf', data: 'YmJi' });
+  useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
   assert.notEqual(tabA, tabB);
   assert.equal(useStore.getState().currentPage, 1);
@@ -131,10 +157,10 @@ test('document tabs preserve independent viewer, chat, and page-index state', ()
 
 test('opening an already-open PDF focuses its existing tab', () => {
   useStore.getState().setPdfFile(null);
-  const fileA = { path: 'A.pdf', name: 'A.pdf', data: 'YWFh' };
+  const fileA = pdf('A.pdf');
   useStore.getState().setPdfFile(fileA);
   const tabA = useStore.getState().activeDocumentTabId;
-  useStore.getState().setPdfFile({ path: 'B.pdf', name: 'B.pdf', data: 'YmJi' });
+  useStore.getState().setPdfFile(pdf('B.pdf'));
   useStore.getState().setPdfFile(fileA);
   assert.equal(useStore.getState().documentTabs.length, 2);
   assert.equal(useStore.getState().activeDocumentTabId, tabA);
@@ -142,9 +168,9 @@ test('opening an already-open PDF focuses its existing tab', () => {
 
 test('closing tabs selects the nearest document and returns to welcome after the final tab', () => {
   useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile({ path: 'A.pdf', name: 'A.pdf', data: 'YWFh' });
+  useStore.getState().setPdfFile(pdf('A.pdf'));
   const tabA = useStore.getState().activeDocumentTabId;
-  useStore.getState().setPdfFile({ path: 'B.pdf', name: 'B.pdf', data: 'YmJi' });
+  useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
   useStore.getState().closeDocumentTab(tabB);
   assert.equal(useStore.getState().activeDocumentTabId, tabA);
@@ -157,14 +183,14 @@ test('closing tabs selects the nearest document and returns to welcome after the
 
 test('background chat updates remain attached to their originating document tab', () => {
   useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile({ path: 'A.pdf', name: 'A.pdf', data: 'YWFh' });
+  useStore.getState().setPdfFile(pdf('A.pdf'));
   const tabA = useStore.getState().activeDocumentTabId;
   const conversationA = useStore.getState().newConversation();
   useStore.getState().addMessage(conversationA, {
     id: 'assistant-a', role: 'assistant', content: '', timestamp: 1,
   }, tabA);
   useStore.getState().setIsStreaming(true, tabA);
-  useStore.getState().setPdfFile({ path: 'B.pdf', name: 'B.pdf', data: 'YmJi' });
+  useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
 
   useStore.getState().updateLastAssistantMessage(conversationA, 'Answer for A', tabA);
@@ -179,7 +205,7 @@ test('background chat updates remain attached to their originating document tab'
 
 test('annotations can be commented, removed, undone, and redone', () => {
   useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile({ path: 'annotations.pdf', name: 'annotations.pdf', data: 'cGRm' });
+  useStore.getState().setPdfFile(pdf('annotations.pdf'));
   const highlight = {
     id: 'highlight-1',
     page: 2,

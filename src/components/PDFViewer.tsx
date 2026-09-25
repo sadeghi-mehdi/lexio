@@ -1,17 +1,32 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import * as pdfjsLib from 'pdfjs-dist';
-import { TextLayer } from 'pdfjs-dist';
+import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react';
 import { useStore } from '../stores/useStore';
+import { openPdfDocument, pdfjsLib } from '../utils/pdfjs';
+import { loadRegisteredDocument } from '../utils/pdf-document-registry';
 import SelectionActionBar from './SelectionActionBar';
 import CommentModal from './CommentModal';
 import type { AnnotationType, RelativeRect } from '../types';
 import { hasExceededDragThreshold } from '../utils/selection-gesture';
 import { copyText } from '../utils/clipboard';
 import { findNearestVisiblePage } from '../utils/page-visibility';
-import { findDocumentMatches } from '../utils/document-search';
+import { findDocumentMatches, type DocumentSearchMatch } from '../utils/document-search';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+// Rendered canvases are kept only for pages within this distance of the
+// current page. An A4 canvas at 2x DPR is about 8 MB, so keeping every page a
+// reader scrolls past would grow memory without bound.
+const KEEP_RENDERED_DISTANCE = 5;
+// Extracted page text is committed to the store in batches of this size.
+const EXTRACTION_BATCH = 25;
+const SEARCH_DEBOUNCE_MS = 150;
+const WHEEL_ZOOM_SETTLE_MS = 150;
+
+type PageSize = { width: number; height: number };
+type TextContent = Awaited<ReturnType<pdfjsLib.PDFPageProxy['getTextContent']>>;
+
+// Page sizes per parsed document. Documents live across tab switches (see
+// pdf-document-registry), so switching back to a tab reuses its sizes.
+const pageSizeCache = new WeakMap<pdfjsLib.PDFDocumentProxy, Map<number, PageSize>>();
 
 const HIGHLIGHT_COLORS: Record<string, string> = {
   yellow: 'rgba(255, 235, 59, 0.4)',
@@ -222,6 +237,7 @@ export default function PDFViewer() {
   const renderedPagesRef = useRef<Map<number, string>>(new Map());
   const observerPageUpdateRef = useRef(false);
   const positionedLayoutRef = useRef('');
+  const scrolledPageRef = useRef(0);
 
   // Per-page word cache + viewport dimensions (set during render)
   const wordCacheRef = useRef<Map<number, WordBox[]>>(new Map());
@@ -248,14 +264,38 @@ export default function PDFViewer() {
   const overlayRef = useRef<Map<number, { layer: HTMLDivElement; pool: HTMLDivElement[] }>>(new Map());
   const searchOverlayRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const pagesWrapperRef = useRef<HTMLDivElement>(null);
+  const textContentCacheRef = useRef<Map<number, Promise<TextContent>>>(new Map());
+  const intersectingPagesRef = useRef<Set<number>>(new Set());
+  const activeSearchMatchRef = useRef<DocumentSearchMatch | null>(null);
 
   const {
-    pdfFile, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts,
+    hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts,
     highlights, activeTool, activeHighlightColor,
-    setNumPages, setCurrentPage, setPageText, setPdfText, setZoom, addHighlight,
+    setNumPages, setCurrentPage, mergePageTexts, addHighlight,
     setExtractionProgress, setSelectedTextForAI, clearSelectedTextForAI,
     setSidebarOpen, setSidebarTab,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+    hasPdf: Boolean(state.pdfFile),
+    activeDocumentTabId: state.activeDocumentTabId,
+    documentSessionId: state.documentSessionId,
+    zoom: state.zoom,
+    currentPage: state.currentPage,
+    numPages: state.numPages,
+    pageTexts: state.pageTexts,
+    highlights: state.highlights,
+    activeTool: state.activeTool,
+    activeHighlightColor: state.activeHighlightColor,
+    setNumPages: state.setNumPages,
+    setCurrentPage: state.setCurrentPage,
+    mergePageTexts: state.mergePageTexts,
+    addHighlight: state.addHighlight,
+    setExtractionProgress: state.setExtractionProgress,
+    setSelectedTextForAI: state.setSelectedTextForAI,
+    clearSelectedTextForAI: state.clearSelectedTextForAI,
+    setSidebarOpen: state.setSidebarOpen,
+    setSidebarTab: state.setSidebarTab,
+  })));
 
   const [selectionInfo, setSelectionInfo] = useState<{
     text: string;
@@ -271,16 +311,34 @@ export default function PDFViewer() {
   } | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  // Matching runs over the whole document, so it waits until typing pauses.
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const [pdfDocument, setPdfDocument] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
-  const [pageBaseSizes, setPageBaseSizes] = useState<Map<number, { width: number; height: number }>>(
+  const [pageBaseSizes, setPageBaseSizes] = useState<Map<number, PageSize>>(
     () => new Map()
   );
   const searchMatches = useMemo(
-    () => findDocumentMatches(pageTexts, searchQuery),
-    [pageTexts, searchQuery]
+    () => findDocumentMatches(pageTexts, debouncedQuery),
+    [pageTexts, debouncedQuery]
   );
   const activeSearchMatch = searchMatches[searchMatchIndex] ?? null;
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(searchQuery), SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  // One text-content request per page, shared by extraction and rendering.
+  // Entries are dropped for pages far from the viewport to bound memory.
+  const loadTextContent = useCallback((page: pdfjsLib.PDFPageProxy): Promise<TextContent> => {
+    let entry = textContentCacheRef.current.get(page.pageNumber);
+    if (!entry) {
+      entry = page.getTextContent();
+      textContentCacheRef.current.set(page.pageNumber, entry);
+    }
+    return entry;
+  }, []);
 
   // ─── Coordinate conversion: page-local px → relative 0-1 ───
 
@@ -363,7 +421,7 @@ export default function PDFViewer() {
   const renderSearchHighlightsForPage = useCallback((pageNum: number) => {
     searchOverlayRef.current.get(pageNum)?.remove();
     searchOverlayRef.current.delete(pageNum);
-    const query = searchQuery.trim().toLocaleLowerCase();
+    const query = debouncedQuery.trim().toLocaleLowerCase();
     const pageDiv = pagesRef.current.get(pageNum);
     const boxes = wordCacheRef.current.get(pageNum);
     if (!query || !pageDiv || !boxes || boxes.length === 0) return;
@@ -387,24 +445,27 @@ export default function PDFViewer() {
     }
     if (matches.length === 0) return;
 
+    // Markers are styled by CSS (.search-hit). Moving between matches only
+    // flips data-search-active on a few markers instead of rebuilding layers.
+    const active = activeSearchMatchRef.current;
     const layer = document.createElement('div');
     layer.className = 'search-highlight-layer';
     layer.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:4;';
     for (const match of matches) {
-      const isActive = activeSearchMatch?.page === pageNum
-        && activeSearchMatch.occurrence === match.occurrence;
+      const isActive = active?.page === pageNum && active.occurrence === match.occurrence;
       for (const [rectIndex, rect] of match.rects.entries()) {
         const marker = document.createElement('div');
+        marker.className = 'search-hit';
         marker.dataset.searchOccurrence = String(match.occurrence);
         marker.dataset.searchActive = isActive ? 'true' : 'false';
         marker.dataset.searchPrimary = rectIndex === 0 ? 'true' : 'false';
-        marker.style.cssText = `position:absolute;left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;background:${isActive ? 'rgba(249,115,22,0.62)' : 'rgba(250,204,21,0.32)'};outline:${isActive ? '2px solid rgba(234,88,12,0.98)' : '1px solid rgba(250,204,21,0.75)'};border-radius:2px;box-shadow:${isActive ? '0 0 0 2px rgba(255,255,255,0.45)' : 'none'};`;
+        marker.style.cssText = `left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px;`;
         layer.appendChild(marker);
       }
     }
     pageDiv.appendChild(layer);
     searchOverlayRef.current.set(pageNum, layer);
-  }, [activeSearchMatch, searchQuery]);
+  }, [debouncedQuery]);
 
   // ─── Highlight rendering ───
 
@@ -451,6 +512,8 @@ export default function PDFViewer() {
     renderedPagesRef.current.clear();
     wordCacheRef.current.clear();
     viewportSizeRef.current.clear();
+    textContentCacheRef.current.clear();
+    intersectingPagesRef.current.clear();
     pagesRef.current.forEach((pageDiv) => { pageDiv.innerHTML = ''; });
     observerPageUpdateRef.current = false;
     positionedLayoutRef.current = '';
@@ -464,68 +527,96 @@ export default function PDFViewer() {
   // ─── Load PDF ───
 
   useEffect(() => {
-    if (!pdfFile) return;
+    const pdfFile = useStore.getState().pdfFile;
+    if (!pdfFile || !activeDocumentTabId) return;
     const viewerTabId = activeDocumentTabId;
     const viewerIsActive = () => useStore.getState().activeDocumentTabId === viewerTabId;
     let cancelled = false;
-    let loadedDocument: pdfjsLib.PDFDocumentProxy | null = null;
+    const stillCurrent = () => !cancelled && viewerIsActive();
+
     const loadPdf = async () => {
       const textAlreadyExtracted = useStore.getState().documentTextReady;
-      const data = Uint8Array.from(atob(pdfFile.data), (c) => c.charCodeAt(0));
-      const doc = await pdfjsLib.getDocument({
-        data,
-        cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
-        cMapPacked: true,
-      }).promise;
-      loadedDocument = doc;
-      if (cancelled || !viewerIsActive()) {
-        await doc.destroy();
-        return;
+      // The parsed document is shared with the thumbnail sidebar and survives
+      // tab switches, so switching back to a tab does not parse the file again.
+      const doc = await loadRegisteredDocument(viewerTabId, () => openPdfDocument(pdfFile.data));
+      if (!stillCurrent()) return;
+
+      // Show the page column right away. Until real sizes are known, every
+      // page uses the first page's size; odd-sized pages are corrected below.
+      let sizes = pageSizeCache.get(doc);
+      const sizesKnown = Boolean(sizes);
+      if (!sizes) {
+        const firstViewport = (await doc.getPage(1)).getViewport({ scale: 1 });
+        if (!stillCurrent()) return;
+        sizes = new Map();
+        for (let i = 1; i <= doc.numPages; i++) {
+          sizes.set(i, { width: firstViewport.width, height: firstViewport.height });
+        }
       }
-
-      const pages = await Promise.all(
-        Array.from({ length: doc.numPages }, (_, index) => doc.getPage(index + 1))
-      );
-      if (cancelled || !viewerIsActive()) return;
-
-      const baseSizes = new Map<number, { width: number; height: number }>();
-      pages.forEach((page, index) => {
-        const viewport = page.getViewport({ scale: 1 });
-        baseSizes.set(index + 1, { width: viewport.width, height: viewport.height });
-      });
 
       pdfDocRef.current = doc;
-      setPageBaseSizes(baseSizes);
+      setPageBaseSizes(sizes);
       setPdfDocument(doc);
       setNumPages(doc.numPages);
-      if (textAlreadyExtracted) return;
-      let fullText = '';
-      for (let i = 1; i <= pages.length; i++) {
-        if (cancelled || !viewerIsActive()) return;
-        const page = pages[i - 1];
-        const textContent = await page.getTextContent();
-        if (cancelled || !viewerIsActive()) return;
-        const pageText = textContent.items
-          .map((item: any) => `${item.str || ''}${item.hasEOL ? '\n' : ' '}`)
-          .join('')
-          .replace(/[ \t]+\n/g, '\n')
-          .trim();
-        setPageText(i, pageText);
-        setExtractionProgress(i, i === doc.numPages);
-        fullText += `\n--- Page ${i} ---\n${pageText}`;
+      if (sizesKnown && textAlreadyExtracted) return;
+
+      // One background pass reads each page once for both its real size and
+      // (on first open) its text. Text is committed in batches so the store
+      // and its subscribers update once per batch, not once per page.
+      const actualSizes = new Map(sizes);
+      let sizesChanged = false;
+      let batch: Array<[number, string]> = [];
+      for (let i = 1; i <= doc.numPages; i++) {
+        if (!stillCurrent()) return;
+        const page = await doc.getPage(i);
+        if (!sizesKnown) {
+          const viewport = page.getViewport({ scale: 1 });
+          const assumed = actualSizes.get(i);
+          if (!assumed || assumed.width !== viewport.width || assumed.height !== viewport.height) {
+            actualSizes.set(i, { width: viewport.width, height: viewport.height });
+            sizesChanged = true;
+          }
+        }
+        if (!textAlreadyExtracted) {
+          const textContent = await loadTextContent(page);
+          if (!stillCurrent()) return;
+          batch.push([i, textContent.items
+            .map((item: any) => `${item.str || ''}${item.hasEOL ? '\n' : ' '}`)
+            .join('')
+            .replace(/[ \t]+\n/g, '\n')
+            .trim()]);
+          // Keep the text content only if the page is about to be rendered.
+          if (Math.abs(i - useStore.getState().currentPage) > KEEP_RENDERED_DISTANCE) {
+            textContentCacheRef.current.delete(i);
+          }
+          if (batch.length >= EXTRACTION_BATCH || i === doc.numPages) {
+            mergePageTexts(batch);
+            setExtractionProgress(i, i === doc.numPages);
+            batch = [];
+          }
+        }
       }
-      if (cancelled || !viewerIsActive()) return;
-      setPdfText(fullText);
+      if (!stillCurrent()) return;
+      pageSizeCache.set(doc, actualSizes);
+      if (sizesChanged) setPageBaseSizes(actualSizes);
     };
     void loadPdf().catch((error) => {
       if (!cancelled) console.error('Failed to load PDF:', error);
     });
     return () => {
       cancelled = true;
-      if (pdfDocRef.current === loadedDocument) pdfDocRef.current = null;
-      void loadedDocument?.destroy();
+      pdfDocRef.current = null;
     };
-  }, [activeDocumentTabId, documentSessionId, setNumPages, setPageText, setPdfText, setExtractionProgress]);
+  }, [activeDocumentTabId, documentSessionId, setNumPages, mergePageTexts, setExtractionProgress, loadTextContent]);
+
+  // Cancel in-flight renders when the viewer unmounts (tab switch or close).
+  // The parsed document itself stays in the registry until its tab closes.
+  useEffect(() => () => {
+    for (const task of renderTasksRef.current.values()) {
+      try { task.cancel(); } catch {}
+    }
+    renderTasksRef.current.clear();
+  }, []);
 
   // A zoom change invalidates rendered canvases, but page placeholders retain
   // exact scaled dimensions so scrolling and page tracking remain stable.
@@ -590,7 +681,7 @@ export default function PDFViewer() {
           !pageDiv.isConnected
         ) return;
 
-        const textContent = await page.getTextContent();
+        const textContent = await loadTextContent(page);
         if (
           pdfDocRef.current !== doc ||
           pagesRef.current.get(pageNum) !== pageDiv ||
@@ -602,7 +693,7 @@ export default function PDFViewer() {
         textLayerDiv.dataset.page = String(pageNum);
         pageDiv.appendChild(textLayerDiv);
 
-        const textLayer = new TextLayer({
+        const textLayer = new pdfjsLib.TextLayer({
           textContentSource: textContent,
           container: textLayerDiv,
           viewport,
@@ -629,6 +720,26 @@ export default function PDFViewer() {
       }
     };
 
+    // Free pages that scrolled far away: canvas, text layer, overlays and
+    // pdf.js page resources. Skipped during a drag so a long selection keeps
+    // the character boxes of its starting page.
+    if (!dragRef.current?.active) {
+      for (const pageNum of [...renderedPagesRef.current.keys(), ...renderTasksRef.current.keys()]) {
+        if (Math.abs(pageNum - currentPage) <= KEEP_RENDERED_DISTANCE) continue;
+        const task = renderTasksRef.current.get(pageNum);
+        if (task) { try { task.cancel(); } catch {} }
+        renderTasksRef.current.delete(pageNum);
+        renderedPagesRef.current.delete(pageNum);
+        wordCacheRef.current.delete(pageNum);
+        viewportSizeRef.current.delete(pageNum);
+        textContentCacheRef.current.delete(pageNum);
+        searchOverlayRef.current.delete(pageNum);
+        const pageDiv = pagesRef.current.get(pageNum);
+        if (pageDiv) pageDiv.innerHTML = '';
+        void pdfDocument.getPage(pageNum).then((page) => page.cleanup()).catch(() => {});
+      }
+    }
+
     const start = Math.max(1, currentPage - 2);
     const end = Math.min(numPages, currentPage + 3);
     for (let i = start; i <= end; i++) {
@@ -647,6 +758,7 @@ export default function PDFViewer() {
     zoom,
     renderHighlightsForPage,
     renderSearchHighlightsForPage,
+    loadTextContent,
   ]);
 
   // ─── Re-render highlights when they change ───
@@ -662,27 +774,49 @@ export default function PDFViewer() {
   }, [highlights, renderHighlightsForPage]);
 
   useEffect(() => {
-    if (!searchQuery.trim()) {
+    if (!debouncedQuery.trim()) {
       clearSearchOverlays();
       return;
     }
-    pagesRef.current.forEach((_, pageNum) => renderSearchHighlightsForPage(pageNum));
-  }, [searchQuery, clearSearchOverlays, renderSearchHighlightsForPage]);
+    // Only rendered pages have character boxes; others are skipped inside.
+    renderedPagesRef.current.forEach((_, pageNum) => renderSearchHighlightsForPage(pageNum));
+  }, [debouncedQuery, clearSearchOverlays, renderSearchHighlightsForPage]);
+
+  // Move the "active" styling between markers without rebuilding overlays.
+  useEffect(() => {
+    activeSearchMatchRef.current = activeSearchMatch;
+    searchOverlayRef.current.forEach((layer, pageNum) => {
+      layer.querySelectorAll<HTMLElement>('[data-search-active="true"]').forEach((marker) => {
+        marker.dataset.searchActive = 'false';
+      });
+      if (activeSearchMatch?.page !== pageNum) return;
+      layer.querySelectorAll<HTMLElement>(`[data-search-occurrence="${activeSearchMatch.occurrence}"]`)
+        .forEach((marker) => { marker.dataset.searchActive = 'true'; });
+    });
+  }, [activeSearchMatch]);
 
   // ─── Scroll to current page ───
 
   useEffect(() => {
     if (!pdfDocument || pageBaseSizes.size !== numPages) return;
     if (observerPageUpdateRef.current) {
+      // The reader scrolled here; the view is already on this page.
       observerPageUpdateRef.current = false;
+      scrolledPageRef.current = currentPage;
       return;
     }
     const pageDiv = pagesRef.current.get(currentPage);
     if (pageDiv) {
       const layoutSignature = `${documentSessionId}:${zoom}`;
       const layoutWasPositioned = positionedLayoutRef.current === layoutSignature;
+      // Real page sizes arrive after the first paint. That refinement alone
+      // must not scroll: the reader may already be elsewhere and the page
+      // observer may not have reported it yet. Browser scroll anchoring keeps
+      // the view steady while pages above it change height.
+      if (layoutWasPositioned && scrolledPageRef.current === currentPage) return;
       pageDiv.scrollIntoView({ behavior: layoutWasPositioned ? 'smooth' : 'auto', block: 'start' });
       positionedLayoutRef.current = layoutSignature;
+      scrolledPageRef.current = currentPage;
     }
   }, [currentPage, documentSessionId, pdfDocument, pageBaseSizes, numPages, zoom]);
 
@@ -691,8 +825,17 @@ export default function PDFViewer() {
   useEffect(() => {
     if (!containerRef.current || !pdfDocument || pageBaseSizes.size !== numPages) return;
     const viewerTabId = activeDocumentTabId;
+    const intersecting = intersectingPagesRef.current;
+    intersecting.clear();
     const observer = new IntersectionObserver(
-      () => {
+      (entries) => {
+        // Track which pages overlap the viewport from the entries themselves,
+        // then measure only those few pages instead of every page.
+        for (const entry of entries) {
+          const page = Number((entry.target as HTMLElement).dataset.page);
+          if (entry.isIntersecting) intersecting.add(page);
+          else intersecting.delete(page);
+        }
         if (useStore.getState().activeDocumentTabId !== viewerTabId) return;
         const container = containerRef.current;
         if (!container) return;
@@ -700,12 +843,12 @@ export default function PDFViewer() {
         const nearestPage = findNearestVisiblePage(
           rootRect.top,
           rootRect.bottom,
-          [...pagesRef.current.entries()]
-            .filter(([, pageDiv]) => pageDiv.isConnected)
-            .map(([page, pageDiv]) => {
-              const rect = pageDiv.getBoundingClientRect();
-              return { page, top: rect.top, bottom: rect.bottom };
-            })
+          [...intersecting].flatMap((page) => {
+            const pageDiv = pagesRef.current.get(page);
+            if (!pageDiv?.isConnected) return [];
+            const rect = pageDiv.getBoundingClientRect();
+            return [{ page, top: rect.top, bottom: rect.bottom }];
+          })
         );
         if (nearestPage !== null && nearestPage !== useStore.getState().currentPage) {
           observerPageUpdateRef.current = true;
@@ -723,34 +866,63 @@ export default function PDFViewer() {
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    let pendingZoom: number | null = null;
+    let settleTimer = 0;
 
+    // While the wheel moves, scale the already-rendered pages with a CSS
+    // transform (cheap, GPU). Only after the wheel has been still for
+    // WHEEL_ZOOM_SETTLE_MS is the zoom committed, which re-renders the pages
+    // once at the final size instead of once per wheel tick.
     const handleWheel = (e: WheelEvent) => {
       if (!e.ctrlKey && !e.metaKey) return;
       e.preventDefault();
+      const committedZoom = useStore.getState().zoom;
+      const wrapper = pagesWrapperRef.current;
+      if (pendingZoom === null && wrapper) {
+        const rect = container.getBoundingClientRect();
+        wrapper.style.transformOrigin = `50% ${container.scrollTop + e.clientY - rect.top}px`;
+      }
       const delta = e.deltaY > 0 ? -0.1 : 0.1;
-      setZoom(zoom + delta);
+      pendingZoom = Math.max(0.25, Math.min(5, (pendingZoom ?? committedZoom) + delta));
+      if (wrapper) wrapper.style.transform = `scale(${pendingZoom / committedZoom})`;
+      window.clearTimeout(settleTimer);
+      settleTimer = window.setTimeout(() => {
+        if (wrapper) wrapper.style.transform = '';
+        const nextZoom = pendingZoom;
+        pendingZoom = null;
+        if (nextZoom !== null) useStore.getState().setZoom(nextZoom);
+      }, WHEEL_ZOOM_SETTLE_MS);
     };
 
     container.addEventListener('wheel', handleWheel, { passive: false });
-    return () => container.removeEventListener('wheel', handleWheel);
-  }, [zoom, setZoom]);
+    return () => {
+      window.clearTimeout(settleTimer);
+      container.removeEventListener('wheel', handleWheel);
+      if (pagesWrapperRef.current) pagesWrapperRef.current.style.transform = '';
+    };
+  }, []);
 
   // ─── Determine which page the cursor is over ───
+  // Hit-testing asks the browser for the element under the cursor instead of
+  // measuring every page on every mouse move.
 
   const getPageAtPoint = useCallback((
     clientX: number,
     clientY: number,
     allowHorizontalOutside = false
   ): number | null => {
-    for (const [pageNum, pageDiv] of pagesRef.current) {
-      const r = pageDiv.getBoundingClientRect();
-      const withinY = clientY >= r.top && clientY <= r.bottom;
-      const withinX = clientX >= r.left && clientX <= r.right;
-      if (withinY && (withinX || allowHorizontalOutside)) {
-        return pageNum;
-      }
-    }
-    return null;
+    const pageAt = (x: number, y: number) => {
+      const pageDiv = document.elementFromPoint(x, y)?.closest<HTMLElement>('.pdf-page-container');
+      return pageDiv?.dataset.page ? Number(pageDiv.dataset.page) : null;
+    };
+    const page = pageAt(clientX, clientY);
+    if (page !== null || !allowHorizontalOutside) return page;
+    // The cursor is beside the page column while dragging: probe the middle
+    // of the viewer at the same height.
+    const container = containerRef.current;
+    if (!container) return null;
+    const rect = container.getBoundingClientRect();
+    return pageAt(rect.left + rect.width / 2, clientY);
   }, []);
 
   // ─── Convert client coords to page-local coords ───
@@ -1076,6 +1248,7 @@ export default function PDFViewer() {
   const closeSearch = useCallback(() => {
     setSearchOpen(false);
     setSearchQuery('');
+    setDebouncedQuery('');
     setSearchMatchIndex(0);
     clearSearchOverlays();
   }, [clearSearchOverlays]);
@@ -1113,12 +1286,12 @@ export default function PDFViewer() {
 
   useEffect(() => {
     setSearchMatchIndex(0);
-    if (searchQuery.trim() && searchMatches[0]) {
+    if (debouncedQuery.trim() && searchMatches[0]) {
       setCurrentPage(searchMatches[0].page);
     }
     // searchMatches is calculated from this exact query during render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, setCurrentPage]);
+  }, [debouncedQuery, setCurrentPage]);
 
   useEffect(() => {
     if (searchMatches.length === 0) {
@@ -1129,7 +1302,7 @@ export default function PDFViewer() {
   }, [searchMatches.length, searchMatchIndex]);
 
   useEffect(() => {
-    if (!activeSearchMatch || !searchQuery.trim()) return;
+    if (!activeSearchMatch || !debouncedQuery.trim()) return;
 
     setCurrentPage(activeSearchMatch.page);
     let attempts = 0;
@@ -1150,7 +1323,7 @@ export default function PDFViewer() {
     };
     animationFrame = window.requestAnimationFrame(revealActiveMatch);
     return () => window.cancelAnimationFrame(animationFrame);
-  }, [activeSearchMatch, searchQuery, setCurrentPage]);
+  }, [activeSearchMatch, debouncedQuery, setCurrentPage]);
 
   // ─── Render ───
 
@@ -1189,7 +1362,7 @@ export default function PDFViewer() {
             className="w-52 bg-transparent px-1 py-1 text-sm text-text-primary outline-none placeholder:text-text-muted"
           />
           <span className="min-w-[62px] text-center text-[11px] text-text-muted">
-            {!searchQuery.trim()
+            {!debouncedQuery.trim()
               ? ''
               : searchMatches.length === 0
                 ? 'No results'
@@ -1226,7 +1399,10 @@ export default function PDFViewer() {
           </button>
         </div>
       )}
-      <div className="flex flex-col items-center py-6 gap-4 min-h-full">
+      {/* w-max + min-w-full: pages wider than the viewer widen the column so
+          the viewer scrolls horizontally, instead of centering them with
+          their left edge cut off and unreachable. */}
+      <div ref={pagesWrapperRef} className="flex flex-col items-center py-6 px-4 gap-4 min-h-full w-max min-w-full">
         {pdfDocument && pageBaseSizes.size === numPages && Array.from(
           { length: numPages },
           (_, i) => i + 1
@@ -1248,7 +1424,7 @@ export default function PDFViewer() {
             />
           );
         })}
-        {(!pdfDocument || pageBaseSizes.size !== numPages) && pdfFile && (
+        {(!pdfDocument || pageBaseSizes.size !== numPages) && hasPdf && (
           <div className="flex items-center justify-center h-full text-text-muted">
             Loading PDF…
           </div>

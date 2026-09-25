@@ -1,4 +1,5 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import {
   Send,
   Square,
@@ -117,13 +118,11 @@ export default function AISidebar() {
     selectedPageForAI,
     selectedEndPageForAI,
     selectedRectsForAI,
-    pdfFile,
+    hasPdf,
     documentSessionId,
-    pageTexts,
     extractedPageCount,
     documentTextReady,
     numPages,
-    documentDigest,
     digestStatus,
     digestProgress,
     digestError,
@@ -140,21 +139,56 @@ export default function AISidebar() {
     setActiveProvider,
     rebuildDocumentDigest,
     cancelDocumentDigest,
-  } = useStore();
+    approveDocumentDigest,
+  } = useStore(useShallow((state) => ({
+    conversations: state.conversations,
+    activeConversation: state.activeConversation,
+    isStreaming: state.isStreaming,
+    selectedTextForAI: state.selectedTextForAI,
+    selectedPageForAI: state.selectedPageForAI,
+    selectedEndPageForAI: state.selectedEndPageForAI,
+    selectedRectsForAI: state.selectedRectsForAI,
+    hasPdf: Boolean(state.pdfFile),
+    documentSessionId: state.documentSessionId,
+    extractedPageCount: state.extractedPageCount,
+    documentTextReady: state.documentTextReady,
+    numPages: state.numPages,
+    digestStatus: state.digestStatus,
+    digestProgress: state.digestProgress,
+    digestError: state.digestError,
+    sidebarTab: state.sidebarTab,
+    settings: state.settings,
+    newConversation: state.newConversation,
+    addMessage: state.addMessage,
+    updateLastAssistantMessage: state.updateLastAssistantMessage,
+    setActiveConversation: state.setActiveConversation,
+    setIsStreaming: state.setIsStreaming,
+    deleteConversation: state.deleteConversation,
+    clearSelectedTextForAI: state.clearSelectedTextForAI,
+    setSidebarTab: state.setSidebarTab,
+    setActiveProvider: state.setActiveProvider,
+    rebuildDocumentDigest: state.rebuildDocumentDigest,
+    cancelDocumentDigest: state.cancelDocumentDigest,
+    approveDocumentDigest: state.approveDocumentDigest,
+  })));
 
   const [input, setInput] = useState('');
   const [showProviderMenu, setShowProviderMenu] = useState(false);
   const [contextStatus, setContextStatus] = useState<string | null>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const activeConv = conversations.find((c) => c.id === activeConversation);
   const activeProviderConfig = settings.providers[settings.activeProvider];
   const documentQuestionReady = documentTextReady;
 
-  // Auto-scroll to bottom
+  // Follow new output only while the reader is at the bottom. An instant jump
+  // is used because starting a smooth scroll per streamed frame was costly
+  // and fought with a reader scrolling up.
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const messages = messagesRef.current;
+    if (messages && stickToBottomRef.current) messages.scrollTop = messages.scrollHeight;
   }, [activeConv?.messages]);
 
   // When text is selected for AI, focus the input (but don't populate it)
@@ -204,6 +238,7 @@ export default function AISidebar() {
       (userMsg as any).rects = selectionRects;
     }
     addMessage(convId, userMsg, requestTabId);
+    stickToBottomRef.current = true;
     setInput('');
     clearSelectedTextForAI();
 
@@ -220,6 +255,7 @@ export default function AISidebar() {
 
     const abort = new AbortController();
     registerChatRequest(requestTabId, abort);
+    let streamFrame = 0;
 
     try {
       const state = useStore.getState();
@@ -344,15 +380,31 @@ export default function AISidebar() {
         settings.customInstructions
       );
 
+      // Tokens can arrive hundreds of times per second. Keep only the latest
+      // text and write it to the store at most once per animation frame.
+      let pendingText: string | null = null;
+      const flushPending = () => {
+        streamFrame = 0;
+        if (pendingText === null) return;
+        updateLastAssistantMessage(convId!, pendingText, requestTabId);
+        pendingText = null;
+      };
       await requestProviderText(
         provider,
         apiMessages,
         systemPrompt,
         activeProviderConfig,
         abort.signal,
-        (accumulated) => updateLastAssistantMessage(convId!, accumulated, requestTabId)
+        (accumulated) => {
+          pendingText = accumulated;
+          if (!streamFrame) streamFrame = window.requestAnimationFrame(flushPending);
+        }
       );
+      window.cancelAnimationFrame(streamFrame);
+      flushPending();
     } catch (err: any) {
+      // A queued frame must not overwrite the error message below.
+      window.cancelAnimationFrame(streamFrame);
       if (err.name !== 'AbortError') {
         updateLastAssistantMessage(convId, `⚠️ Error: ${err.message}`, requestTabId);
       }
@@ -365,8 +417,6 @@ export default function AISidebar() {
     input,
     isStreaming,
     activeConversation,
-    pageTexts,
-    documentDigest,
     documentTextReady,
     settings.activeProvider,
     settings.contextMode,
@@ -522,23 +572,29 @@ export default function AISidebar() {
           )}
 
           {/* Messages */}
-          <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+          <div
+            ref={messagesRef}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+            }}
+            className="flex-1 overflow-y-auto px-3 py-3 space-y-3"
+          >
             {!activeConv || activeConv.messages.length === 0 ? (
               <EmptyChat />
             ) : (
               activeConv.messages.map((msg) => <ChatBubble key={msg.id} message={msg} />)
             )}
-            <div ref={chatEndRef} />
           </div>
 
           {/* Input */}
           <div className="flex-shrink-0 p-3 border-t border-surface-3">
-            {pdfFile && settings.contextMode === 'rawEntire' && !documentTextReady && !selectedTextForAI && (
+            {hasPdf && settings.contextMode === 'rawEntire' && !documentTextReady && !selectedTextForAI && (
               <div className="mb-2 rounded-lg border border-accent/20 bg-accent/5 px-2.5 py-2 text-[11px] text-accent-light">
                 Extracting PDF text… {extractedPageCount} / {numPages || '…'} pages.
               </div>
             )}
-            {pdfFile && settings.contextMode === 'documentAware' && !selectedTextForAI && digestStatus !== 'ready' && (
+            {hasPdf && settings.contextMode === 'documentAware' && !selectedTextForAI && digestStatus !== 'ready' && (
               <div className={`mb-2 rounded-lg border px-2.5 py-2 text-[11px] ${
                 digestStatus === 'error'
                   ? 'border-red-500/30 bg-red-500/5 text-red-300'
@@ -548,6 +604,11 @@ export default function AISidebar() {
                 {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
                   <button onClick={cancelDocumentDigest} className="mt-1 underline hover:text-text-primary">
                     Cancel digest generation
+                  </button>
+                )}
+                {digestStatus === 'needs-approval' && (
+                  <button onClick={approveDocumentDigest} className="mt-1 underline hover:text-text-primary">
+                    Build page index
                   </button>
                 )}
                 {(digestStatus === 'error' || digestStatus === 'cancelled') && (
@@ -645,9 +706,12 @@ function TabButton({
   );
 }
 
-function ChatBubble({ message }: { message: ChatMessage }) {
+// Memoized: while one answer streams, the other bubbles keep the same message
+// object and skip re-rendering and re-formatting entirely.
+const ChatBubble = memo(function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user';
   const [copied, setCopied] = useState(false);
+  const html = useMemo(() => formatMarkdown(message.content), [message.content]);
 
   const copyMessage = async () => {
     try {
@@ -684,9 +748,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
         {message.content ? (
           <div
             className="whitespace-pre-wrap break-words"
-            dangerouslySetInnerHTML={{
-              __html: formatMarkdown(message.content),
-            }}
+            dangerouslySetInnerHTML={{ __html: html }}
           />
         ) : (
           <div className="loading-dots flex gap-1.5 py-1">
@@ -706,7 +768,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
       )}
     </div>
   );
-}
+});
 
 function MessageCopyButton({
   copied,

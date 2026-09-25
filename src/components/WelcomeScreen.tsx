@@ -1,33 +1,22 @@
 import { Upload } from 'lucide-react';
 import { useStore } from '../stores/useStore';
+import { readPdfFile } from '../utils/pdf-save';
 import logoSvg from '../assets/logo.svg';
 
 export default function WelcomeScreen() {
-  const { setPdfFile } = useStore();
-
   const handleClick = () => {
     if (window.electronAPI) {
       window.electronAPI.openPdf();
-    } else {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.pdf';
-      input.onchange = (e) => {
-        const file = (e.target as HTMLInputElement).files?.[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = (reader.result as string).split(',')[1];
-          setPdfFile({
-            path: (file as File & { path?: string }).path || file.name,
-            name: file.name,
-            data: base64,
-          });
-        };
-        reader.readAsDataURL(file);
-      };
-      input.click();
+      return;
     }
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.pdf';
+    input.onchange = async (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file) useStore.getState().setPdfFile(await readPdfFile(file));
+    };
+    input.click();
   };
 
   return (

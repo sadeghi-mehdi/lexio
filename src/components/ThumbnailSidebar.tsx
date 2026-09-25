@@ -1,6 +1,8 @@
-import { useRef, useEffect, useCallback } from 'react';
-import * as pdfjsLib from 'pdfjs-dist';
+import { useRef, useEffect, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
+import { openPdfDocument, type pdfjsLib } from '../utils/pdfjs';
+import { loadRegisteredDocument } from '../utils/pdf-document-registry';
 
 const THUMBNAIL_WIDTH = 120;
 const THUMBNAIL_SCALE = 0.2;
@@ -9,101 +11,74 @@ export default function ThumbnailSidebar() {
   const containerRef = useRef<HTMLDivElement>(null);
   const thumbnailsRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
   const thumbnailItemsRef = useRef<Map<number, HTMLDivElement>>(new Map());
-  const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const renderedPagesRef = useRef<Set<number>>(new Set());
   const renderTasksRef = useRef<Map<number, any>>(new Map());
-  const loadGenerationRef = useRef(0);
+  const [pdfDocument, setPdfDocument] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
 
-  const { pdfFile, numPages, currentPage, setCurrentPage } = useStore();
+  const { activeDocumentTabId, numPages, currentPage, setCurrentPage } = useStore(useShallow((state) => ({
+    activeDocumentTabId: state.activeDocumentTabId,
+    numPages: state.numPages,
+    currentPage: state.currentPage,
+    setCurrentPage: state.setCurrentPage,
+  })));
 
-  // Load PDF document
+  // Reuse the document the viewer parsed for this tab instead of loading a
+  // second copy of the PDF (and a second pdf.js worker).
   useEffect(() => {
-    if (!pdfFile) return;
-    const generation = ++loadGenerationRef.current;
-    let loadedDocument: pdfjsLib.PDFDocumentProxy | null = null;
-
-    const loadPdf = async () => {
-      const data = Uint8Array.from(atob(pdfFile.data), (c) => c.charCodeAt(0));
-      const doc = await pdfjsLib.getDocument({ data }).promise;
-      loadedDocument = doc;
-      if (generation !== loadGenerationRef.current) {
-        await doc.destroy();
-        return;
-      }
-      pdfDocRef.current = doc;
-      renderedPagesRef.current.clear();
-
-      // Trigger re-render of visible thumbnails
-      renderVisibleThumbnails();
-    };
-
-    void loadPdf().catch((error) => {
-      if (generation === loadGenerationRef.current) {
-        console.error('Failed to load PDF thumbnails:', error);
-      }
-    });
-
+    const pdfFile = useStore.getState().pdfFile;
+    if (!pdfFile || !activeDocumentTabId) return;
+    let cancelled = false;
+    loadRegisteredDocument(activeDocumentTabId, () => openPdfDocument(pdfFile.data))
+      .then((doc) => { if (!cancelled) setPdfDocument(doc); })
+      .catch((error) => { if (!cancelled) console.error('Failed to load PDF thumbnails:', error); });
     return () => {
-      loadGenerationRef.current++;
+      cancelled = true;
       for (const task of renderTasksRef.current.values()) {
         try { task.cancel(); } catch {}
       }
       renderTasksRef.current.clear();
-      if (pdfDocRef.current === loadedDocument) pdfDocRef.current = null;
-      void loadedDocument?.destroy();
+      renderedPagesRef.current.clear();
     };
-  }, [pdfFile]);
+  }, [activeDocumentTabId]);
 
-  // Render a single thumbnail
-  const renderThumbnail = useCallback(async (pageNum: number) => {
-    const doc = pdfDocRef.current;
-    const canvas = thumbnailsRef.current.get(pageNum);
-    if (!doc || !canvas || renderedPagesRef.current.has(pageNum)) return;
-
-    renderedPagesRef.current.add(pageNum);
-
-    try {
-      const page = await doc.getPage(pageNum);
-      const viewport = page.getViewport({ scale: THUMBNAIL_SCALE });
-
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const renderTask = page.render({
-        canvasContext: ctx,
-        viewport,
-      });
-      renderTasksRef.current.set(pageNum, renderTask);
-      await renderTask.promise;
-    } catch (error: any) {
-      renderedPagesRef.current.delete(pageNum);
-      if (error?.name !== 'RenderingCancelledException') {
-        console.error(`Failed to render thumbnail ${pageNum}:`, error);
-      }
-    } finally {
-      renderTasksRef.current.delete(pageNum);
-    }
-  }, []);
-
-  // Render visible thumbnails using IntersectionObserver
-  const renderVisibleThumbnails = useCallback(() => {
-    if (!pdfDocRef.current) return;
-
-    thumbnailsRef.current.forEach((_, pageNum) => {
-      renderThumbnail(pageNum);
-    });
-  }, [renderThumbnail]);
-
-  // Re-render when numPages changes
+  // Render a thumbnail only when it scrolls into view. Rendering all of them
+  // at load flooded the pdf.js worker and slowed down the main page view.
   useEffect(() => {
-    if (numPages > 0 && pdfDocRef.current) {
-      // Small delay to ensure canvases are mounted
-      setTimeout(renderVisibleThumbnails, 100);
-    }
-  }, [numPages, renderVisibleThumbnails]);
+    const container = containerRef.current;
+    if (!container || !pdfDocument || numPages === 0) return;
+
+    const renderThumbnail = async (pageNum: number) => {
+      const canvas = thumbnailsRef.current.get(pageNum);
+      if (!canvas || renderedPagesRef.current.has(pageNum)) return;
+      renderedPagesRef.current.add(pageNum);
+      try {
+        const page = await pdfDocument.getPage(pageNum);
+        const viewport = page.getViewport({ scale: THUMBNAIL_SCALE });
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        const renderTask = page.render({ canvasContext: ctx, viewport });
+        renderTasksRef.current.set(pageNum, renderTask);
+        await renderTask.promise;
+      } catch (error: any) {
+        renderedPagesRef.current.delete(pageNum);
+        if (error?.name !== 'RenderingCancelledException') {
+          console.error(`Failed to render thumbnail ${pageNum}:`, error);
+        }
+      } finally {
+        renderTasksRef.current.delete(pageNum);
+      }
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) void renderThumbnail(Number((entry.target as HTMLElement).dataset.page));
+      }
+    }, { root: container, rootMargin: '300px 0px' });
+    thumbnailItemsRef.current.forEach((item) => observer.observe(item));
+    return () => observer.disconnect();
+  }, [pdfDocument, numPages]);
 
   // Scroll to current page thumbnail
   useEffect(() => {
@@ -112,10 +87,6 @@ export default function ThumbnailSidebar() {
       thumbnail.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }, [currentPage]);
-
-  const handleThumbnailClick = (pageNum: number) => {
-    setCurrentPage(pageNum);
-  };
 
   return (
     <div
@@ -126,11 +97,12 @@ export default function ThumbnailSidebar() {
         {Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => (
           <div
             key={pageNum}
+            data-page={pageNum}
             ref={(el) => {
               if (el) thumbnailItemsRef.current.set(pageNum, el);
               else thumbnailItemsRef.current.delete(pageNum);
             }}
-            onClick={() => handleThumbnailClick(pageNum)}
+            onClick={() => setCurrentPage(pageNum)}
             className={`cursor-pointer rounded-lg overflow-hidden transition-all ${
               pageNum === currentPage
                 ? 'ring-2 ring-accent shadow-lg'

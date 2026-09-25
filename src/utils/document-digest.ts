@@ -50,8 +50,7 @@ function normalizeType(value: unknown): DigestSection['sectionType'] {
     : 'other';
 }
 
-export async function fingerprintPdf(base64Data: string): Promise<string> {
-  const bytes = Uint8Array.from(atob(base64Data), (character) => character.charCodeAt(0));
+export async function fingerprintPdf(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   const hash = await crypto.subtle.digest('SHA-256', bytes);
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
@@ -65,12 +64,43 @@ export function parseJsonObject(text: string): unknown {
   try {
     return JSON.parse(cleaned);
   } catch {
-    for (let start = cleaned.indexOf('{'); start >= 0; start = cleaned.indexOf('{', start + 1)) {
-      for (let end = cleaned.lastIndexOf('}'); end > start; end = cleaned.lastIndexOf('}', end - 1)) {
-        try {
-          return JSON.parse(cleaned.slice(start, end + 1));
-        } catch {
-          // Try the next balanced-looking candidate.
+    // Common case: prose around one object. Try first "{" to last "}".
+    const first = cleaned.indexOf('{');
+    const last = cleaned.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      try {
+        return JSON.parse(cleaned.slice(first, last + 1));
+      } catch {
+        // Fall through to the balanced scan.
+      }
+    }
+    // Single pass over the text. Track brace depth, ignoring braces inside
+    // JSON strings, and try to parse each top-level {...} span once. This is
+    // linear in the text length, unlike trying every "{" with every "}".
+    let depth = 0;
+    let start = -1;
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < cleaned.length; index++) {
+      const character = cleaned[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"' && depth > 0) inString = true;
+      else if (character === '{') {
+        if (depth === 0) start = index;
+        depth++;
+      } else if (character === '}' && depth > 0) {
+        depth--;
+        if (depth === 0) {
+          try {
+            return JSON.parse(cleaned.slice(start, index + 1));
+          } catch {
+            // Keep scanning for the next top-level object.
+          }
         }
       }
     }

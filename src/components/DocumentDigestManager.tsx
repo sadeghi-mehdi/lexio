@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
-import { providers } from '../providers/ai-providers';
+import { useShallow } from 'zustand/react/shallow';
+import { isLocalProvider, providers } from '../providers/ai-providers';
 import { useStore } from '../stores/useStore';
 import type { ChatMessage, DigestTopic, PageRange } from '../types';
 import { chunkDocument } from '../utils/document-context';
@@ -15,6 +16,11 @@ import {
   validateDocumentDigest,
   type DigestFragment,
 } from '../utils/document-digest';
+
+// Finished digest parts per document fingerprint. Switching tabs or providers
+// aborts a running digest; when it restarts with the same provider, model and
+// chunk size it continues from the first unfinished part.
+const partialDigests = new Map<string, { key: string; fragments: DigestFragment[] }>();
 import { requestProviderText } from '../utils/provider-request';
 
 const DIGEST_SYSTEM_PROMPT = `You create a reusable, page-aware digest of PDF documents for later retrieval.
@@ -94,20 +100,48 @@ function normalizeSynthesis(raw: unknown, pageCount: number): { overview: string
 export default function DocumentDigestManager() {
   const abortRef = useRef<AbortController | null>(null);
   const lastRebuildRef = useRef(new Map<string, number>());
+  // Only values that should restart the digest are subscribed to. Model
+  // names are compared as strings, so editing an unrelated provider or
+  // switching the chat provider (when the digest uses a fixed one) is ignored.
   const {
     activeDocumentTabId,
-    pdfFile,
+    hasPdf,
     documentSessionId,
-    pageTexts,
     numPages,
     documentTextReady,
     digestRebuildToken,
     digestCancelToken,
-    settings,
-    setDocumentFingerprint,
-    setDocumentDigest,
-    setDigestState,
-  } = useStore();
+    digestApproved,
+    digestEnabled,
+    digestAutoCloud,
+    digestChunkChars,
+    digestProviderId,
+    digestModel,
+    providerEnabled,
+    providerIsLocal,
+  } = useStore(useShallow((state) => {
+    const { settings } = state;
+    const providerId = settings.digestProvider === 'active' ? settings.activeProvider : settings.digestProvider;
+    const baseConfig = settings.providers[providerId];
+    return {
+      activeDocumentTabId: state.activeDocumentTabId,
+      hasPdf: Boolean(state.pdfFile),
+      documentSessionId: state.documentSessionId,
+      numPages: state.numPages,
+      documentTextReady: state.documentTextReady,
+      digestRebuildToken: state.digestRebuildToken,
+      digestCancelToken: state.digestCancelToken,
+      digestApproved: state.digestApproved,
+      digestEnabled: settings.digestEnabled,
+      digestAutoCloud: settings.digestAutoCloud,
+      digestChunkChars: settings.digestChunkChars,
+      digestProviderId: providerId,
+      digestModel: settings.digestModels[providerId]?.trim() || baseConfig?.model || '',
+      providerEnabled: Boolean(baseConfig?.enabled),
+      providerIsLocal: baseConfig ? isLocalProvider(baseConfig) : false,
+    };
+  }));
+  const { setDocumentFingerprint, setDocumentDigest, setDigestState } = useStore.getState();
 
   useEffect(() => {
     if (digestCancelToken === 0) return;
@@ -115,24 +149,20 @@ export default function DocumentDigestManager() {
   }, [digestCancelToken]);
 
   useEffect(() => {
-    if (!pdfFile || !documentTextReady || !settings.digestEnabled) {
-      if (!settings.digestEnabled && pdfFile) setDigestState('idle', 'Document digest is disabled');
+    if (!hasPdf || !documentTextReady || !digestEnabled) {
+      if (!digestEnabled && hasPdf) setDigestState('idle', 'Document digest is disabled');
       return;
     }
 
-    const digestProviderId = settings.digestProvider === 'active'
-      ? settings.activeProvider
-      : settings.digestProvider;
+    const { settings } = useStore.getState();
     const provider = providers[digestProviderId];
     const baseConfig = settings.providers[digestProviderId];
-    const config = baseConfig
-      ? { ...baseConfig, model: settings.digestModels[digestProviderId]?.trim() || baseConfig.model }
-      : undefined;
+    const config = baseConfig ? { ...baseConfig, model: digestModel } : undefined;
     if (!provider || !config) {
       setDigestState('error', '', 'The selected AI provider is unavailable.');
       return;
     }
-    if (!config.enabled) {
+    if (!providerEnabled) {
       setDigestState('error', '', `${config.name} is disabled. Enable it in Settings to build the page index.`);
       return;
     }
@@ -145,15 +175,22 @@ export default function DocumentDigestManager() {
     const run = async () => {
       try {
         setDigestState('loading', 'Checking the reusable document digest cache…');
-        const fingerprint = await fingerprintPdf(pdfFile.data);
+        const { pdfFile, documentFingerprint, pageTexts } = useStore.getState();
+        if (!pdfFile) return;
+        // The main process hashes the file when it is opened, and the tab
+        // session keeps the result, so this rarely hashes anything.
+        const fingerprint = documentFingerprint || pdfFile.fingerprint || await fingerprintPdf(pdfFile.data);
         if (disposed || abort.signal.aborted) return;
-        setDocumentFingerprint(fingerprint);
+        if (fingerprint !== documentFingerprint) setDocumentFingerprint(fingerprint);
 
         const tabId = activeDocumentTabId || 'no-document';
         const previousRebuildToken = lastRebuildRef.current.get(tabId) || 0;
         const rebuilding = digestRebuildToken > previousRebuildToken;
         lastRebuildRef.current.set(tabId, digestRebuildToken);
-        if (rebuilding) await deleteCachedDigest(fingerprint);
+        if (rebuilding) {
+          partialDigests.delete(fingerprint);
+          await deleteCachedDigest(fingerprint);
+        }
 
         if (!rebuilding) {
           const cached = validateDocumentDigest(
@@ -168,12 +205,25 @@ export default function DocumentDigestManager() {
           }
         }
 
-        const chunks = chunkDocument(pageTexts, settings.digestChunkChars);
+        // A cloud provider receives the full document text. Ask first unless
+        // the user opted in to building page indexes automatically.
+        if (!providerIsLocal && !digestAutoCloud && !useStore.getState().digestApproved) {
+          setDigestState(
+            'needs-approval',
+            `Building the page index sends the full text of this PDF to ${config.name}. Nothing is sent until you approve.`
+          );
+          return;
+        }
+
+        const chunks = chunkDocument(pageTexts, digestChunkChars);
         if (chunks.length === 0) {
           throw new Error('No extractable PDF text is available for digest generation.');
         }
-        const fragments: DigestFragment[] = [];
-        for (let index = 0; index < chunks.length; index++) {
+        const partialKey = `${digestProviderId}:${config.model}:${digestChunkChars}`;
+        const partial = partialDigests.get(fingerprint);
+        const fragments: DigestFragment[] = partial?.key === partialKey ? partial.fragments : [];
+        partialDigests.set(fingerprint, { key: partialKey, fragments });
+        for (let index = fragments.length; index < chunks.length; index++) {
           const chunk = chunks[index];
           setDigestState(
             'generating',
@@ -188,7 +238,7 @@ export default function DocumentDigestManager() {
           const response = await requestProviderText(
             provider,
             [message],
-            fragmentPrompt(settings.customInstructions),
+            fragmentPrompt(useStore.getState().settings.customInstructions),
             config,
             abort.signal
           );
@@ -208,7 +258,7 @@ export default function DocumentDigestManager() {
                 content: `Return a valid JSON digest for these PDF pages. Output JSON only and follow the required schema exactly.\n\n${chunk.text}`,
                 timestamp: Date.now(),
               }],
-              fragmentPrompt(settings.customInstructions),
+              fragmentPrompt(useStore.getState().settings.customInstructions),
               config,
               abort.signal
             );
@@ -233,7 +283,7 @@ export default function DocumentDigestManager() {
           })),
           topics: fragment.topics,
         }));
-        const synthesisInput = JSON.stringify(compactFragments).slice(0, settings.digestChunkChars);
+        const synthesisInput = JSON.stringify(compactFragments).slice(0, digestChunkChars);
         try {
           const response = await requestProviderText(
             provider,
@@ -243,7 +293,7 @@ export default function DocumentDigestManager() {
               content: `Consolidate these page-range digests into a whole-document overview and major topics.\n\n${synthesisInput}`,
               timestamp: Date.now(),
             }],
-            synthesisPrompt(settings.customInstructions),
+            synthesisPrompt(useStore.getState().settings.customInstructions),
             config,
             abort.signal
           );
@@ -265,6 +315,7 @@ export default function DocumentDigestManager() {
         if (synthesizedTopics.length > 0) digest.majorTopics = synthesizedTopics;
         digest = completeDigestPageIndex(digest, pageTexts);
         await saveCachedDigest(digest);
+        partialDigests.delete(fingerprint);
         if (disposed || abort.signal.aborted) return;
         setDocumentDigest(digest);
         setDigestState('ready', `Document page index ready — ${digest.pages.length} pages`);
@@ -285,17 +336,23 @@ export default function DocumentDigestManager() {
       disposed = true;
       abort.abort();
     };
+    // The setters from getState() are stable store actions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     documentSessionId,
     activeDocumentTabId,
+    hasPdf,
     documentTextReady,
     digestRebuildToken,
+    digestApproved,
     numPages,
-    settings.digestEnabled,
-    settings.digestChunkChars,
-    settings.activeProvider,
-    settings.digestProvider,
-    settings.digestModels,
+    digestEnabled,
+    digestAutoCloud,
+    digestChunkChars,
+    digestProviderId,
+    digestModel,
+    providerEnabled,
+    providerIsLocal,
   ]);
 
   return null;

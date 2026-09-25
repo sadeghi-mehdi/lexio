@@ -1,14 +1,14 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { X, Eye, EyeOff, Check, ExternalLink } from 'lucide-react';
 import { useStore } from '../stores/useStore';
 import type { AIProvider } from '../types';
 import { normalizeSettings } from '../utils/settings-migration';
 
-const PROVIDER_DOCS: Record<AIProvider, string> = {
+const PROVIDER_DOCS: Partial<Record<AIProvider, string>> = {
   ollama: 'https://ollama.com/download',
   claude: 'https://console.anthropic.com/settings/keys',
   openai: 'https://platform.openai.com/api-keys',
-  openaiCompatible: 'https://openai.rc.asu.edu/',
   gemini: 'https://aistudio.google.com/app/apikey',
 };
 
@@ -26,7 +26,17 @@ export default function SettingsPanel() {
     updateProviderConfig,
     setSettingsOpen,
     updateSettings,
-  } = useStore();
+  } = useStore(useShallow((state) => ({
+    settings: state.settings,
+    updateProviderConfig: state.updateProviderConfig,
+    setSettingsOpen: state.setSettingsOpen,
+    updateSettings: state.updateSettings,
+  })));
+  const [credentialStatus, setCredentialStatus] = useState<{ persistent: boolean; weak: boolean } | null>(null);
+
+  useEffect(() => {
+    window.electronAPI?.credentialStatus().then(setCredentialStatus).catch(() => {});
+  }, []);
   const [activeTab, setActiveTab] = useState<AIProvider>(settings.activeProvider);
   const [showKey, setShowKey] = useState(false);
   const [customDigestProvider, setCustomDigestProvider] = useState<AIProvider | null>(null);
@@ -143,13 +153,14 @@ export default function SettingsPanel() {
                   placeholder={
                     activeTab === 'ollama'
                       ? 'http://localhost:11434'
-                      : 'https://openai.rc.asu.edu/v1'
+                      : 'https://your-endpoint.example/v1'
                   }
                   className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors font-mono"
                 />
                 {activeTab === 'openaiCompatible' && (
                   <p className="text-[11px] text-text-muted mt-1">
                     Enter the API root ending in /v1. Lexio adds /chat/completions automatically.
+                    Remote servers must use https://. Plain http:// only works for localhost.
                   </p>
                 )}
               </SettingField>
@@ -159,16 +170,17 @@ export default function SettingsPanel() {
             {activeTab !== 'ollama' && (
               <SettingField
                 label="API Key"
-                action={
+                action={PROVIDER_DOCS[activeTab] && (
+                  // Opened in the system browser by the main process.
                   <a
                     href={PROVIDER_DOCS[activeTab]}
                     target="_blank"
-                    rel="noopener"
+                    rel="noopener noreferrer"
                     className="flex items-center gap-1 text-[11px] text-accent-light hover:underline"
                   >
                     Get key <ExternalLink size={10} />
                   </a>
-                }
+                )}
               >
                 <div className="relative">
                   <input
@@ -190,6 +202,16 @@ export default function SettingsPanel() {
                     {showKey ? <EyeOff size={15} /> : <Eye size={15} />}
                   </button>
                 </div>
+                {credentialStatus && !credentialStatus.persistent && (
+                  <p className="mt-1 text-[11px] text-amber-300">
+                    No system keychain is available, so API keys are kept for this session only and are not saved to disk.
+                  </p>
+                )}
+                {credentialStatus?.weak && (
+                  <p className="mt-1 text-[11px] text-amber-300">
+                    No system keyring was found. API keys are saved with Electron's basic_text fallback, which does not really protect them. Install and unlock a keyring (for example GNOME Keyring or KWallet) for real encryption.
+                  </p>
+                )}
               </SettingField>
             )}
 
@@ -269,6 +291,19 @@ export default function SettingsPanel() {
                     Build once and cache headings, section titles, descriptions, and up to 20 keywords per page. Answers use original PDF text, not the index.
                   </span>
                 </label>
+                {settings.digestEnabled && (
+                  <label className="mt-2 flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                    <input
+                      type="checkbox"
+                      checked={settings.digestAutoCloud}
+                      onChange={(event) => updateSettings({ digestAutoCloud: event.target.checked })}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <span className="text-xs text-text-secondary">
+                      Build page indexes with cloud providers without asking. When off, Lexio asks before sending a document's full text to a cloud provider. Local providers never ask.
+                    </span>
+                  </label>
+                )}
               </SettingField>
 
               {settings.digestEnabled && (

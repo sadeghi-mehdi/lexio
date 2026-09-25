@@ -256,3 +256,19 @@
   0%, 100% { opacity: 0.3; transform: scale(0.8); }
   50% { opacity: 1; transform: scale(1); }
 }
+
+/* ─── Find-in-document markers ─── */
+/* Toggling data-search-active restyles a marker without rebuilding overlays. */
+
+.search-hit {
+  position: absolute;
+  border-radius: 2px;
+  background: rgba(250, 204, 21, 0.32);
+  outline: 1px solid rgba(250, 204, 21, 0.75);
+}
+
+.search-hit[data-search-active="true"] {
+  background: rgba(249, 115, 22, 0.62);
+  outline: 2px solid rgba(234, 88, 12, 0.98);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.45);
+}
