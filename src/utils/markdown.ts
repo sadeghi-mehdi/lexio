@@ -30,3 +30,15 @@ export function formatMarkdown(text: string): string {
     .replace(/^# (.+)$/gm, '<strong class="text-xl">$1</strong>')
     .replace(/^- (.+)$/gm, '• $1');
 }
+
+// The markdown tables in an answer as CSV (tables separated by a blank
+// line), for pasting into a spreadsheet. Null when there is no table.
+export function tablesToCsv(text: string): string | null {
+  const tables = text.match(/(^\|.*\|[ \t]*\n\|[ \t:|-]+\|[ \t]*\n(?:\|.*\|[ \t]*(?:\n|$))*)/gm);
+  if (!tables) return null;
+  const quote = (cell: string) => (/[",\n]/.test(cell) ? `"${cell.replace(/"/g, '""')}"` : cell);
+  return tables.map((table) => table.trim().split('\n')
+    .filter((_, index) => index !== 1)
+    .map((row) => row.trim().replace(/^\||\|$/g, '').split('|').map((cell) => quote(cell.trim())).join(','))
+    .join('\n')).join('\n\n');
+}

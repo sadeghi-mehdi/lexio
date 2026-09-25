@@ -13,6 +13,7 @@ import {
   Copy,
   Check,
   StickyNote,
+  Layers,
 } from 'lucide-react';
 import { useStore, WORKSPACE_CHAT, type DocumentTabSession } from '../stores/useStore';
 import { providers } from '../providers/ai-providers';
@@ -25,19 +26,34 @@ import { loadLibrary, saveLibrary } from '../utils/library-store';
 import {
   assignLabels,
   documentsInScope,
+  prepareAnalysis,
   prepareRequest,
   type OpenDocument,
 } from '../utils/workspace-chat';
+import { CARD_VERSION, type PaperCard } from '../utils/paper-cards';
 import { documentKey, tabDocumentIndex } from './DocumentIndexer';
 import AnnotationsPanel from './AnnotationsPanel';
 import { copyText } from '../utils/clipboard';
-import { formatMarkdown } from '../utils/markdown';
+import { formatMarkdown, tablesToCsv } from '../utils/markdown';
 
 const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 
 // All chats are saved together, under a fixed key in the library store.
 const CHATS_KEY = 'c6582f8e9722f051ceb75ffcc93fd3ac0246d56ea0707980e740643d2e890305';
 const CHATS_VERSION = 1;
+
+// Paper cards are cached per file hash and model.
+async function loadCard(key: string, model: string): Promise<PaperCard | null> {
+  const saved = await loadLibrary<{ cards: Record<string, PaperCard> }>('cards', key);
+  const card = saved?.cards?.[model];
+  return card?.version === CARD_VERSION ? card : null;
+}
+
+function saveCard(key: string, card: PaperCard): void {
+  void loadLibrary<{ cards: Record<string, PaperCard> }>('cards', key).then((saved) =>
+    saveLibrary('cards', key, { cards: { ...(saved?.cards || {}), [card.model]: card } })
+  );
+}
 
 // Open PDFs, most recently viewed first.
 function openDocuments(): OpenDocument[] {
@@ -179,10 +195,11 @@ export default function AISidebar() {
     setScope(activeConversation, { mode: 'custom', keys: [...keys] });
   };
 
-  const sendMessage = useCallback(async () => {
+  // analyze: ask each document separately, then combine (the Analyze button).
+  const sendMessage = useCallback(async (analyze = false) => {
     const text = input.trim();
     const state = useStore.getState();
-    if ((!text && !state.selectedTextForAI) || state.isStreaming) return;
+    if ((!text && !state.selectedTextForAI && !analyze) || state.isStreaming) return;
 
     const convId = state.activeConversation || newConversation();
     let conversation = useStore.getState().conversations.find((c) => c.id === convId)!;
@@ -196,8 +213,10 @@ export default function AISidebar() {
     useStore.getState().updateConversation(convId, { documents: labels });
     const label = (key: string | undefined) => labels.find((item) => item.key === key)?.label || '';
 
-    const question = selectionText ? text || 'Please explain the selected passage.' : text;
-    const selection = selectionText
+    const question = selectionText && !analyze
+      ? text || 'Please explain the selected passage.'
+      : text || (analyze ? 'Compare these documents: research question, method, data, main findings and limitations.' : text);
+    const selection = selectionText && !analyze
       ? {
           text: selectionText,
           key: activeKey || '',
@@ -246,22 +265,23 @@ export default function AISidebar() {
       conversation = useStore.getState().conversations.find((c) => c.id === convId)!;
       // prepareRequest reads the conversation up to and including the new
       // question, so drop the empty answer placeholder.
-      const request = await prepareRequest({
-        question,
-        selection,
+      const common = {
         conversation: { ...conversation, messages: conversation.messages.slice(0, -1) },
         documents: scoped,
         labels,
         settings: state.settings,
         config,
         provider,
-        queryVector: embedQuery,
         signal: abort.signal,
-        onProgress: (status) => {
+        loadCard,
+        onProgress: (status: string) => {
           setContextStatus(status);
           useStore.getState().updateLastAssistantMessage(convId, status);
         },
-      });
+      };
+      const request = analyze
+        ? await prepareAnalysis({ ...common, question, saveCard })
+        : await prepareRequest({ ...common, question, selection, queryVector: embedQuery });
       setContextStatus(`Using ${request.description}${request.notes.length ? ` and ${request.notes.length} of your markings` : ''}`);
       useStore.getState().patchLastAssistantMessage(convId, {
         content: '',
@@ -329,7 +349,7 @@ export default function AISidebar() {
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      sendMessage(false);
     }
   };
 
@@ -532,6 +552,14 @@ export default function AISidebar() {
                 >
                   <StickyNote size={10} /> Notes {settings.includeNotes ? 'on' : 'off'}
                 </button>
+                <button
+                  onClick={() => sendMessage(true)}
+                  disabled={isStreaming || !anyReady}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:text-accent-light disabled:opacity-40"
+                  title={`Analyze across documents: asks each of the ${inScope.filter((document) => document.ready).length} selected PDFs your question separately, then combines the answers (${inScope.filter((document) => document.ready).length + 1} requests). With an empty question it compares them.`}
+                >
+                  <Layers size={10} /> Analyze
+                </button>
               </div>
             )}
 
@@ -570,7 +598,7 @@ export default function AISidebar() {
                 className="block w-full bg-surface-2 text-text-primary text-sm leading-5 rounded-xl px-4 py-3 pr-12 resize-none outline-none border border-surface-3 focus:border-accent/40 transition-colors placeholder-text-muted"
               />
               <button
-                onClick={isStreaming ? stopStreaming : sendMessage}
+                onClick={isStreaming ? stopStreaming : () => sendMessage(false)}
                 disabled={!isStreaming && !canSend}
                 className={`absolute inset-y-0 right-2 my-auto flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-colors ${
                   isStreaming
@@ -638,6 +666,8 @@ const ChatBubble = memo(function ChatBubble({
     [message, documents]
   );
   const selectionLabel = documents.find((document) => document.key === message.documentKey)?.label;
+  const csv = useMemo(() => (isUser || message.status === 'streaming' ? null : tablesToCsv(message.content)), [isUser, message.content, message.status]);
+  const [csvCopied, setCsvCopied] = useState(false);
 
   const copyMessage = async () => {
     try {
@@ -689,6 +719,20 @@ const ChatBubble = memo(function ChatBubble({
             {message.providerId ? `${message.providerId} · ` : ''}{message.model}
             {message.status === 'aborted' ? ' · stopped' : ''}
             {message.contextDescription ? ` · used ${message.contextDescription}` : ''}
+            {csv && (
+              <button
+                type="button"
+                onClick={async () => {
+                  await copyText(csv);
+                  setCsvCopied(true);
+                  window.setTimeout(() => setCsvCopied(false), 1500);
+                }}
+                className="ml-2 rounded px-1 text-accent-light hover:bg-surface-3"
+                title="Copy the table as CSV for a spreadsheet"
+              >
+                {csvCopied ? 'Copied' : 'Copy table as CSV'}
+              </button>
+            )}
           </div>
         )}
       </div>

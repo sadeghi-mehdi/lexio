@@ -295,6 +295,12 @@ Annotations that other PDF readers understand:
 - Optional "flatten" draws new highlights into the page for printing.
 - Known limits: pdf.js does not expose an annotation's /NM name or a grouped annotation's own text, so Lexio cannot tell its own saved annotations from other apps' and does not show Acrobat's "replace text" suggestions. Thumbnails show the file's annotations as saved.
 
+Cross-document analysis:
+- An "Analyze" button asks each selected PDF the question separately (so each gets the full context budget), then combines the answers in one more request. With an empty question it compares the documents' question, method, data, findings and limitations, usually as a table.
+- Each per-document request also returns a paper card (title, authors, question, method, data, findings with pages, limitations, stated future work), cached per PDF and model. Card page references are kept only for pages that request actually saw. Cached cards are added to later comparison questions.
+- Research-gap questions separate limitations and future work the authors state (cited) from topics none of the loaded documents cover, which are labeled as such and never presented as gaps in the whole field.
+- Answers with tables have a "Copy table as CSV" button.
+
 ### Unreleased: Security and performance hardening
 
 Security:

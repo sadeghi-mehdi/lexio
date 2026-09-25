@@ -169,3 +169,12 @@ test('a follow-up reuses the previous question for search and the previous answe
   assert.equal(request.history[request.history.length - 1].content, 'And when was it finished?');
   assert.deepEqual(request.notes.map((note) => note.ref), ['N1']);
 });
+
+test('answer tables convert to CSV', async () => {
+  const { tablesToCsv } = await import('../src/utils/markdown.ts');
+  assert.equal(tablesToCsv('No table here'), null);
+  assert.equal(
+    tablesToCsv('Intro\n| Paper | Finding |\n|---|---|\n| D1 | 672 mm, fixed |\n| D2 | said "yes" |\n'),
+    'Paper,Finding\nD1,"672 mm, fixed"\nD2,"said ""yes"""'
+  );
+});

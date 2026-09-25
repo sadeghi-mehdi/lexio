@@ -22,6 +22,7 @@ import { requestBudget } from './context-budget.ts';
 import { chunkDocument, groupTextsWithinBudget } from './document-context.ts';
 import { requestProviderText } from './provider-request.ts';
 import { retrieveContext, type PassageRef, type ScopeDocument } from './retrieval.ts';
+import { CARD_SCHEMA, cardText, parseDocumentReply, type PaperCard } from './paper-cards.ts';
 import type { DocumentIndex } from './text-index.ts';
 
 // Everything a chat request needs to know about one open PDF.
@@ -133,6 +134,8 @@ export async function prepareRequest(options: {
   queryVector: (text: string) => Promise<Float32Array | null>;
   signal: AbortSignal;
   onProgress: (status: string) => void;
+  // Cached paper cards, added to comparisons and overviews across documents.
+  loadCard?: (key: string, model: string) => Promise<PaperCard | null>;
 }): Promise<{
   systemPrompt: string;
   history: ChatMessage[];
@@ -245,6 +248,22 @@ export async function prepareRequest(options: {
       contextText = retrieval.text;
       description = retrieval.description;
       sources = retrieval.blocks.map((block) => ({ label: block.label, key: block.key, page: block.page }));
+      if ((retrieval.strategy === 'compare' || retrieval.strategy === 'overview') && retrieval.scope.length > 1 && options.loadCard) {
+        const cardBlocks: string[] = [];
+        for (const label of retrieval.scope) {
+          const document = scope.find((item) => item.label === label);
+          const card = document ? await options.loadCard(document.key, options.config.model) : null;
+          if (!card || !document) continue;
+          cardBlocks.push(cardText(card, label));
+          for (const finding of card.findings) {
+            for (const page of finding.pages) sources.push({ label, key: document.key, page });
+          }
+        }
+        if (cardBlocks.length) {
+          contextText = `Paper cards (summaries made earlier from these documents):\n${cardBlocks.join('\n\n')}\n\n${contextText}`;
+          description += ` and ${cardBlocks.length} paper cards`;
+        }
+      }
     }
   }
 
@@ -270,4 +289,127 @@ export async function prepareRequest(options: {
     customInstructions: settings.customInstructions,
   });
   return { systemPrompt, history, sources, notes, description };
+}
+
+// ─── Cross-document analysis ───
+
+const ANALYSIS_DEFAULT_QUESTION =
+  'Compare these documents: research question, method, data, main findings and limitations. Use a table, then note where they agree and differ.';
+
+// Asks every document in scope the question on its own (each call can use
+// the whole budget for one document), then builds the prompt that combines
+// the per-document answers. Each per-document call also returns a paper card,
+// which is cached. Costs one request per document plus the final one.
+export async function prepareAnalysis(options: {
+  question: string;
+  conversation: ChatConversation;
+  documents: readonly OpenDocument[];
+  labels: readonly ConversationDocument[];
+  settings: AppSettings;
+  config: ProviderConfig;
+  provider: AIProviderInterface;
+  signal: AbortSignal;
+  onProgress: (status: string) => void;
+  loadCard: (key: string, model: string) => Promise<PaperCard | null>;
+  saveCard: (key: string, card: PaperCard) => void;
+}): Promise<{
+  systemPrompt: string;
+  history: ChatMessage[];
+  sources: ContextSource[];
+  notes: NoteReference[];
+  description: string;
+}> {
+  const { settings, config } = options;
+  const question = options.question.trim() || ANALYSIS_DEFAULT_QUESTION;
+  const labelOf = (key: string | undefined) => options.labels.find((item) => item.key === key)?.label;
+  const budget = requestBudget(config, settings.maxContextChars);
+  const ready = options.documents.filter((document) => document.ready);
+  const sources: ContextSource[] = [];
+  const notes: NoteReference[] = [];
+  const perDocument: string[] = [];
+  const cards: string[] = [];
+
+  for (let position = 0; position < ready.length; position++) {
+    const open = ready[position];
+    const label = labelOf(open.key) || `D${position + 1}`;
+    options.onProgress(`Reading ${label} (${position + 1} of ${ready.length}): ${open.name}`);
+    const document = { label, key: open.key, index: open.index(), vectors: open.vectors?.vectors, windowPassages: open.vectors?.passageOf };
+    const marks = settings.includeNotes ? locateMarks([{ ...document, highlights: open.tab.highlights }]) : [];
+    const ranking = settings.highlightWeight ? markRanking(marks, question) : { ranking: [], relevant: [] };
+    const retrieval = retrieveContext({
+      documents: [document],
+      question,
+      budgetTokens: Math.floor(budget.documentTokens * 0.9),
+      extraRankings: ranking.ranking.length ? [ranking.ranking] : [],
+      priority: ranking.relevant.slice(0, 8),
+      decorate: (block) => decorateBlock(block, marks, settings.colorLabels),
+    });
+    const markingList = markingsIndex(marks, question, 3000, settings.colorLabels);
+    const cached = await options.loadCard(open.key, config.model);
+    const reply = await requestProviderText(
+      options.provider,
+      [{
+        id: `analysis-${label}`,
+        role: 'user',
+        content: `Question for this document: ${question}\n\nReturn JSON only:\n{\n  "answer": "the answer for this document alone, citing pages as [${label} p.N] and the user's markings as [${label} N1]; say plainly when the document does not address the question",\n  "card": ${cached ? 'null' : CARD_SCHEMA}\n}`,
+        timestamp: Date.now(),
+      }],
+      buildWorkspacePrompt({
+        contextText: retrieval.text,
+        description: retrieval.description,
+        markings: markingList.text,
+        customInstructions: settings.customInstructions,
+      }),
+      config,
+      options.signal
+    );
+    const parsed = parseDocumentReply(reply, config.model, document.index.pageCount);
+    const sentPages = new Set(retrieval.blocks.map((block) => block.page));
+    if (!cached && parsed.card) {
+      // A new card keeps only page references to pages this call was shown,
+      // so its citations are checked once, when it is made.
+      for (const finding of parsed.card.findings) finding.pages = finding.pages.filter((page) => sentPages.has(page));
+      options.saveCard(open.key, parsed.card);
+    }
+    const card = cached || parsed.card;
+    if (card) cards.push(cardText(card, label));
+    perDocument.push(`──── ${label}: ${open.name} ────\n${parsed.answer}`);
+    sources.push(...retrieval.blocks.map((block) => ({ label, key: open.key, page: block.page })));
+    for (const finding of card?.findings || []) {
+      for (const page of finding.pages) if (!sentPages.has(page)) sources.push({ label, key: open.key, page });
+    }
+    notes.push(...marks.map((mark) => ({ ref: mark.ref, label, key: open.key, page: mark.page, highlightId: mark.highlight.id })));
+  }
+
+  options.onProgress(`Combining ${ready.length} documents…`);
+  const history = buildHistory(options.conversation.messages, budget.historyTokens, labelOf)
+    .map((turn, index): ChatMessage => ({ id: `history-${index}`, role: turn.role, content: turn.content, timestamp: 0 }));
+  // The final question replaces an empty one with the default comparison.
+  if (history.length && history[history.length - 1].role === 'user' && !options.question.trim()) {
+    history[history.length - 1] = { ...history[history.length - 1], content: question };
+  }
+  const instructions = settings.customInstructions.trim();
+  const systemPrompt = `You are Lexio, a reading assistant. You are combining separate analyses of ${ready.length} documents (labeled D1, D2, ...) into one answer to the user's question.
+
+Use only the per-document analyses and paper cards below. Keep their citations ([D1 p.3], [D2 N4]) exactly as given and cite every claim. Do not invent citations.
+Compare the documents directly: where they agree, where they differ, and why (method, data, setting). Use a markdown table when comparing several documents on the same aspects.
+If the question asks about research gaps, separate two kinds and label them:
+1. Limitations and future work the authors state, with citations.
+2. Topics that none of these ${ready.length} documents cover, marked "not covered in these ${ready.length} documents". Never present these as gaps in the whole field; the user has only loaded these documents.
+The user's own notes (quoted as notes by "you") are the user's opinions, never the authors' claims.${instructions ? `\n\n──── USER CUSTOM INSTRUCTIONS ────\n${instructions}\n──── END USER CUSTOM INSTRUCTIONS ────` : ''}
+
+──── PAPER CARDS ────
+${cards.join('\n\n') || '(none)'}
+──── END PAPER CARDS ────
+
+──── PER-DOCUMENT ANALYSES ────
+${perDocument.join('\n\n')}
+──── END PER-DOCUMENT ANALYSES ────`;
+  return {
+    systemPrompt,
+    history,
+    sources,
+    notes,
+    description: `a separate reading of each of ${ready.length} documents (${ready.map((document) => labelOf(document.key)).join(', ')})`,
+  };
 }
