@@ -307,6 +307,11 @@ Deep mode (opt-in):
 - Pages a tool returned count as sent, so citation checks work as usual. The answer lists what the AI looked at.
 - Supported for Claude (tool_use), OpenAI and OpenAI-compatible endpoints (tool_calls), Gemini (function calls) and Ollama (tool_calls). If a model or endpoint rejects tools, the chat answers without deep mode and says so. The request formats follow each API's documentation and are covered by tests with recorded stream formats; they have not been run against the live APIs from this environment.
 
+Scanned PDFs:
+- Pages with almost no text are recognized with Tesseract (English) on your computer, in the background, and cached by file hash. The recognized words become the page's text layer, so they can be selected, highlighted, found with Find, searched and asked about. Text from OCR is labeled as such for the AI.
+- A page can be re-read with the chat's vision model (Claude, OpenAI, Gemini, Ollama or a compatible endpoint) from the document index panel, for tables, equations or poor scans. Cloud providers ask before the page image is sent.
+- Tesseract's worker, WebAssembly cores and English data (about 15 MB) ship with the app and are never loaded from a CDN.
+
 ### Unreleased: Security and performance hardening
 
 Security:

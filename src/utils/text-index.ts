@@ -29,6 +29,8 @@ export interface DocumentIndex {
   // Number of passages containing each term, for BM25 across documents.
   documentFrequency: Map<string, number>;
   totalLength: number;
+  // Pages whose text came from OCR (may contain recognition errors).
+  ocrPages: ReadonlySet<number>;
 }
 
 export interface SearchHit {
@@ -207,6 +209,7 @@ export function buildDocumentIndex(options: {
   pageTexts: ReadonlyMap<number, string>;
   headings?: ReadonlyMap<number, string[]>;
   outline?: OutlineEntry[];
+  ocrPages?: ReadonlySet<number>;
 }): DocumentIndex {
   const pages = new Map<number, string>();
   const passages: Passage[] = [];
@@ -297,6 +300,7 @@ export function buildDocumentIndex(options: {
     passages,
     documentFrequency,
     totalLength,
+    ocrPages: options.ocrPages || new Set(),
   };
 }
 

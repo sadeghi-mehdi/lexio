@@ -304,6 +304,20 @@ export default function SettingsPanel() {
                 )}
               </SettingField>
 
+              <SettingField label="Scanned PDFs">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.ocrEnabled}
+                    onChange={(event) => updateSettings({ ocrEnabled: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Recognize text on scanned pages (OCR, English) on this computer, so they can be searched, selected, highlighted and asked about. A page can also be re-read with the chat's vision model from the document index panel.
+                  </span>
+                </label>
+              </SettingField>
+
               <SettingField label="Meaning-based search">
                 <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
                   <input

@@ -11,6 +11,7 @@ import type {
   AnnotationType,
   RelativeRect,
   IndexStatus,
+  OcrPage,
 } from '../types.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
 import { abortChatRequest } from '../utils/chat-request-registry.ts';
@@ -42,6 +43,7 @@ export interface DocumentTabSession {
   pageTexts: Map<number, string>;
   pageHeadings: Map<number, string[]>;
   documentOutline: OutlineEntry[];
+  ocrPages: Map<number, OcrPage>;
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -74,6 +76,7 @@ interface AppState {
   pageTexts: Map<number, string>;
   pageHeadings: Map<number, string[]>;
   documentOutline: OutlineEntry[];
+  ocrPages: Map<number, OcrPage>;
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -134,6 +137,10 @@ interface AppState {
   // Replaces a tab's annotation list (annotations read from the file merged
   // with saved notes). Not an undoable edit.
   setTabHighlights: (highlights: Highlight[], tabId?: string | null) => void;
+  // Stores recognized text for scanned pages; the text replaces the page's
+  // (nearly empty) extracted text so search, Find and the AI can use it.
+  applyOcrPages: (pages: ReadonlyArray<readonly [number, OcrPage]>, tabId?: string | null) => void;
+  setIndexProgress: (progress: string, tabId?: string | null) => void;
   setEmbeddingState: (status: EmbeddingStatus, progress?: string) => void;
   // Opens a document tab at a page and outlines the page briefly.
   jumpToPage: (tabId: string, page: number) => void;
@@ -204,6 +211,7 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     pageTexts: state.pageTexts,
     pageHeadings: state.pageHeadings,
     documentOutline: state.documentOutline,
+    ocrPages: state.ocrPages,
     extractedPageCount: state.extractedPageCount,
     documentTextReady: state.documentTextReady,
     numPages: state.numPages,
@@ -232,6 +240,7 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     pageTexts: new Map(),
     pageHeadings: new Map(),
     documentOutline: [],
+    ocrPages: new Map(),
     extractedPageCount: 0,
     documentTextReady: false,
     numPages: 0,
@@ -260,6 +269,7 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     pageTexts: session.pageTexts,
     pageHeadings: session.pageHeadings,
     documentOutline: session.documentOutline,
+    ocrPages: session.ocrPages,
     extractedPageCount: session.extractedPageCount,
     documentTextReady: session.documentTextReady,
     numPages: session.numPages,
@@ -318,6 +328,7 @@ export const useStore = create<AppState>((set, get) => ({
   pageTexts: new Map(),
   pageHeadings: new Map(),
   documentOutline: [],
+  ocrPages: new Map(),
   extractedPageCount: 0,
   documentTextReady: false,
   numPages: 0,
@@ -384,6 +395,7 @@ export const useStore = create<AppState>((set, get) => ({
         pageTexts: new Map(),
         pageHeadings: new Map(),
         documentOutline: [],
+        ocrPages: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -462,6 +474,7 @@ export const useStore = create<AppState>((set, get) => ({
         pageTexts: new Map(),
         pageHeadings: new Map(),
         documentOutline: [],
+        ocrPages: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -503,6 +516,18 @@ export const useStore = create<AppState>((set, get) => ({
     set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
   setTabHighlights: (highlights, tabId) =>
     set((s) => patchTab(s, tabId, () => ({ highlights }))),
+  setIndexProgress: (indexProgress, tabId) => set((s) => patchTab(s, tabId, () => ({ indexProgress }))),
+  applyOcrPages: (pages, tabId) =>
+    set((s) => patchTab(s, tabId, (tab) => {
+      if (pages.length === 0) return {};
+      const pageTexts = new Map(tab.pageTexts);
+      const ocrPages = new Map(tab.ocrPages);
+      for (const [page, ocr] of pages) {
+        pageTexts.set(page, ocr.text);
+        ocrPages.set(page, ocr);
+      }
+      return { pageTexts, ocrPages };
+    })),
   setEmbeddingState: (embeddingStatus, embeddingProgress = '') => set({ embeddingStatus, embeddingProgress }),
   jumpToPage: (tabId, page) => {
     if (get().activeDocumentTabId !== tabId) get().switchDocumentTab(tabId);

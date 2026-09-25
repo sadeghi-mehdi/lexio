@@ -20,7 +20,9 @@ import {
 } from '../utils/embedding-client';
 import { EMBEDDING_MODEL_ID, vectorsFromBase64, vectorsToBase64 } from '../utils/embeddings';
 import type { DocumentTabSession } from '../stores/useStore';
-import type { Highlight } from '../types';
+import type { Highlight, OcrPage } from '../types';
+import { needsOcr, recognizePage, renderPageImage } from '../utils/ocr';
+import { chatWithImage } from '../providers/tool-providers';
 import { mergeNotes, NOTES_VERSION, readPageAnnotations, type SavedNotes } from '../utils/pdf-annotations';
 
 // Extracts the text of every open PDF in the background, one tab at a time,
@@ -183,7 +185,8 @@ async function extractTab(tabId: string, signal: AbortSignal): Promise<void> {
   if (useStore.getState().activeDocumentTabId !== tabId) releaseRegisteredDocument(tabId);
 }
 
-type TabLike = Pick<DocumentTabSession, 'pdfFile' | 'pageTexts' | 'pageHeadings' | 'documentOutline'>;
+type TabLike = Pick<DocumentTabSession, 'pdfFile' | 'pageTexts' | 'pageHeadings' | 'documentOutline'> &
+  Partial<Pick<DocumentTabSession, 'ocrPages'>>;
 
 // Key for per-document data: the file hash, or the tab id for a file
 // without one. The same PDF open twice shares its index and vectors.
@@ -199,6 +202,7 @@ export function tabDocumentIndex(tab: TabLike, tabId: string): DocumentIndex {
     pageTexts: tab.pageTexts,
     headings: tab.pageHeadings,
     outline: tab.documentOutline,
+    ocrPages: new Set(tab.ocrPages?.keys() || []),
   });
 }
 
@@ -303,6 +307,116 @@ function scheduleVectors(): void {
     });
 }
 
+// ─── OCR ───
+
+const OCR_CACHE_VERSION = 1;
+let ocrJob: Promise<void> | null = null;
+let ocrRerun = false;
+
+// Recognizes text on scanned pages of every open PDF, active tab first, one
+// page at a time. Results (including empty ones for blank pages) are cached
+// by file hash, so a page is never recognized twice.
+function scheduleOcr(): void {
+  if (!useStore.getState().settings.ocrEnabled) return;
+  if (ocrJob) {
+    ocrRerun = true;
+    return;
+  }
+  ocrJob = (async () => {
+    const current = useStore.getState();
+    const tabIds = [
+      ...(current.activeDocumentTabId && current.pdfFile ? [current.activeDocumentTabId] : []),
+      ...current.documentTabs.map((tab) => tab.id).filter((id) => id !== current.activeDocumentTabId),
+    ];
+    for (const tabId of tabIds) {
+      const found = tabState(tabId);
+      if (!found?.pdfFile || !found.documentTextReady) continue;
+      const tab = found as typeof found & TabLike & { ocrPages: Map<number, OcrPage> };
+      const pending = [...tab.pageTexts.entries()]
+        .filter(([page, text]) => needsOcr(text) && !tab.ocrPages.has(page))
+        .map(([page]) => page)
+        .sort((a, b) => a - b);
+      if (!pending.length) continue;
+      const key = documentKey(tab, tabId);
+      const cacheable = /^[a-f0-9]{64}$/i.test(key);
+      const cached = cacheable ? await loadLibrary<{ version: number; pages: Array<[number, OcrPage]> }>('ocr', key) : null;
+      const results = new Map<number, OcrPage>(cached?.version === OCR_CACHE_VERSION ? cached.pages : []);
+      const fromCache = pending.filter((page) => results.has(page)).map((page) => [page, results.get(page)!] as const);
+      if (fromCache.length) useStore.getState().applyOcrPages(fromCache, tabId);
+      const toRecognize = pending.filter((page) => !results.has(page));
+      if (!toRecognize.length) continue;
+
+      const doc = await loadRegisteredDocument(tabId, () => openPdfDocument(tab.pdfFile.data));
+      for (let position = 0; position < toRecognize.length; position++) {
+        const state = useStore.getState();
+        if (!state.settings.ocrEnabled || !tabState(tabId)) return;
+        state.setIndexProgress(`Recognizing text (OCR) ${position + 1}/${toRecognize.length}`, tabId);
+        const pageNumber = toRecognize[position];
+        const page = await doc.getPage(pageNumber);
+        const ocr = await recognizePage(await renderPageImage(page as never));
+        results.set(pageNumber, ocr);
+        useStore.getState().applyOcrPages([[pageNumber, ocr]], tabId);
+        if (cacheable && (position % 5 === 4 || position === toRecognize.length - 1)) {
+          void saveLibrary('ocr', key, { version: OCR_CACHE_VERSION, pages: [...results.entries()] });
+        }
+      }
+      const pages = toRecognize.length;
+      const low = [...results.values()].filter((result) => result.words.length && result.confidence < 60).length;
+      useStore.getState().setIndexProgress(
+        `Text ready · OCR on ${pages} page${pages === 1 ? '' : 's'}${low ? ` (${low} with low confidence)` : ''}`,
+        tabId
+      );
+      if (useStore.getState().activeDocumentTabId !== tabId) releaseRegisteredDocument(tabId);
+      // Vectors must be recomputed for the new text.
+      scheduleVectors();
+    }
+  })()
+    .catch((error) => console.error('OCR failed:', error))
+    .finally(() => {
+      ocrJob = null;
+      if (ocrRerun) {
+        ocrRerun = false;
+        scheduleOcr();
+      }
+    });
+}
+
+// Re-reads one page with the chat's vision model (for tables, equations or
+// poor scans). The page image is sent to the provider; for cloud providers
+// the caller asks first. Tesseract's word boxes stay for selection; the
+// model's text replaces the page text used for search and the AI.
+export async function rereadPageWithModel(tabId: string, pageNumber: number, signal: AbortSignal): Promise<void> {
+  const state = useStore.getState();
+  const tab = tabState(tabId) as (DocumentTabSession | null);
+  if (!tab?.pdfFile) return;
+  const config = state.settings.providers[state.settings.activeProvider];
+  if (!config.enabled) throw new Error(`${config.name} is disabled. Enable it in Settings first.`);
+  const doc = await loadRegisteredDocument(tabId, () => openPdfDocument(tab.pdfFile.data));
+  const canvas = await renderPageImage((await doc.getPage(pageNumber)) as never);
+  const pngBase64 = canvas.toDataURL('image/png').split(',')[1];
+  state.setIndexProgress(`Reading page ${pageNumber} with ${config.model}…`, tabId);
+  const text = await chatWithImage(
+    state.settings.activeProvider,
+    'Transcribe all text on this page exactly as printed, in reading order. Keep line breaks between paragraphs. Write tables as markdown tables and equations in plain text or LaTeX. Output only the transcription.',
+    pngBase64,
+    config,
+    signal
+  );
+  if (!text.trim()) throw new Error('The model returned no text for this page.');
+  const previous = tabState(tabId)?.ocrPages?.get(pageNumber);
+  const ocr: OcrPage = { text: text.trim(), confidence: 100, words: previous?.words || [], engine: config.model };
+  useStore.getState().applyOcrPages([[pageNumber, ocr]], tabId);
+  useStore.getState().setIndexProgress(`Page ${pageNumber} re-read with ${config.model}`, tabId);
+  const key = documentKey(tab, tabId);
+  if (/^[a-f0-9]{64}$/i.test(key)) {
+    const cached = await loadLibrary<{ version: number; pages: Array<[number, OcrPage]> }>('ocr', key);
+    const pages = new Map(cached?.version === OCR_CACHE_VERSION ? cached.pages : []);
+    pages.set(pageNumber, ocr);
+    void saveLibrary('ocr', key, { version: OCR_CACHE_VERSION, pages: [...pages.entries()] });
+  }
+  scheduleVectors();
+}
+
 async function startEmbedder(): Promise<void> {
   const { setEmbeddingState } = useStore.getState();
   try {
@@ -372,10 +486,13 @@ export default function DocumentIndexer() {
 
   const semanticSearch = useStore((state) => state.settings.semanticSearch);
 
+  const ocrEnabled = useStore((state) => state.settings.ocrEnabled);
+
   useEffect(() => {
     schedule();
     scheduleVectors();
-  }, [signature]);
+    scheduleOcr();
+  }, [signature, ocrEnabled]);
 
   // Load the embedding model at start if it is installed. It is downloaded
   // only when the user asks (see startEmbeddingDownload).

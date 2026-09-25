@@ -3,6 +3,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react';
 import { useStore } from '../stores/useStore';
 import { openPdfDocument, pdfjsLib } from '../utils/pdfjs';
+import { ocrTextContent } from '../utils/ocr';
 import { loadRegisteredDocument } from '../utils/pdf-document-registry';
 import SelectionActionBar from './SelectionActionBar';
 import CommentModal from './CommentModal';
@@ -270,7 +271,7 @@ export default function PDFViewer() {
   const activeSearchMatchRef = useRef<DocumentSearchMatch | null>(null);
 
   const {
-    hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts,
+    hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts, ocrPages,
     highlights, activeTool, activeHighlightColor,
     setNumPages, setCurrentPage, addHighlight,
     setSelectedTextForAI, clearSelectedTextForAI,
@@ -283,6 +284,7 @@ export default function PDFViewer() {
     currentPage: state.currentPage,
     numPages: state.numPages,
     pageTexts: state.pageTexts,
+    ocrPages: state.ocrPages,
     highlights: state.highlights,
     activeTool: state.activeTool,
     activeHighlightColor: state.activeHighlightColor,
@@ -614,10 +616,14 @@ export default function PDFViewer() {
   useEffect(() => {
     if (!pdfDocument || numPages === 0 || pageBaseSizes.size !== numPages) return;
 
-    const renderSignature = `${documentSessionId}:${zoom}`;
+    const baseSignature = `${documentSessionId}:${zoom}`;
 
     const renderPage = async (pageNum: number) => {
       const doc = pdfDocument;
+      // A page re-renders when OCR text arrives for it, so its text layer
+      // (selection, highlights, Find) uses the recognized words.
+      const ocr = ocrPages.get(pageNum);
+      const renderSignature = `${baseSignature}${ocr?.words.length ? ':ocr' : ''}`;
       if (pdfDocRef.current !== doc || renderedPagesRef.current.get(pageNum) === renderSignature) return;
       const existing = renderTasksRef.current.get(pageNum);
       if (existing) { try { existing.cancel(); } catch {} }
@@ -673,7 +679,9 @@ export default function PDFViewer() {
           !pageDiv.isConnected
         ) return;
 
-        const textContent = await loadTextContent(page);
+        const textContent = ocr?.words.length
+          ? (ocrTextContent(ocr, page.getViewport({ scale: 1 })) as unknown as TextContent)
+          : await loadTextContent(page);
         if (
           pdfDocRef.current !== doc ||
           pagesRef.current.get(pageNum) !== pageDiv ||
@@ -742,6 +750,7 @@ export default function PDFViewer() {
       });
     }
   }, [
+    ocrPages,
     pdfDocument,
     pageBaseSizes,
     documentSessionId,

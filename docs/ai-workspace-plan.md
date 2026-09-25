@@ -1,6 +1,6 @@
 # Lexio AI workspace plan
 
-Status: draft for review. Nothing here is implemented yet.
+Status: implemented on branch `claude/brave-johnson-1vmpr3` (phases 0-7). See "Implementation notes" at the end for measurements, deviations and known limits.
 
 ## Goal
 
@@ -342,3 +342,32 @@ Each phase is its own commit. Old page-index code is removed once phase 2 beats 
 ## Open questions
 
 1. Which apps made the three annotated test files? The first and third look like one app, the second a different one.
+
+## Implementation notes
+
+Measurements (generated evaluation set, 30 questions, budget of about four report pages):
+
+| Retrieval | Right text reached the model |
+|---|---|
+| Legacy page retrieval | 56% |
+| New keyword search (BM25, new tokenizer) | 84% |
+| Keyword + meaning (all-MiniLM-L6-v2, sentence windows) | 94% |
+
+- Embedding speed in Node with one WebAssembly thread: about 95 ms per passage. An 8-page paper was ready in about 6 seconds in the browser.
+- Tesseract recognized a generated scanned page in about 1.3 seconds at 96% confidence.
+- App size: about 12 MB for the ONNX runtime WebAssembly file and about 15 MB for OCR. The 23 MB embedding model is downloaded on first use.
+
+Deviations from the plan:
+
+- Keyword and meaning scores are blended with weights (keyword 0.6), not reciprocal rank fusion. Rank fusion scored lower (78%) because it let passages that were merely decent in both lists beat exact matches.
+- Meaning search embeds 2-3 sentence windows and scores a passage by its best window. Embedding whole 1,200-character passages hid single relevant sentences (the answer passage ranked 36th).
+- Tokenizing and indexing run on the main thread in steps; only embeddings and OCR use web workers. Indexing a 26-page paper takes well under a second.
+- New standalone sticky notes are not created in Lexio yet. Sticky notes from other apps are read, shown, commented on and deleted.
+
+Known limits:
+
+- pdf.js does not expose an annotation's /NM name or a grouped annotation's own text, so Lexio cannot tell its own saved annotations from other apps', and Acrobat's "replace text" suggestions are not shown.
+- Questions in a different language than the document (English question, Japanese PDF) are not matched; the embedding model is English-only.
+- Deep mode and vision re-reading follow each provider's documented request and stream formats and are covered by tests with those formats, but were not run against the live APIs from the build environment. Try them with the providers you use.
+- Thumbnails show a PDF's annotations as saved in the file, not unsaved edits.
+- OCR word boxes are placed for unrotated scanned pages; rotated scans are recognized but their selectable text may be misplaced.

@@ -280,3 +280,90 @@ export async function chatWithTools(
     })),
   };
 }
+
+// ─── Image input (vision models) ───
+
+// Sends one image with a text prompt and returns the model's text. Used to
+// re-read a scanned page with a vision model.
+export async function chatWithImage(
+  providerId: AIProvider,
+  prompt: string,
+  pngBase64: string,
+  config: ProviderConfig,
+  signal: AbortSignal,
+  onText: (text: string) => void = () => {}
+): Promise<string> {
+  let text = '';
+  const emit = (token: string) => {
+    if (!token) return;
+    text += token;
+    onText(text);
+  };
+  if (providerId === 'claude') {
+    const response = await send('https://api.anthropic.com/v1/messages', {
+      'x-api-key': config.apiKey || '',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    }, {
+      model: config.model,
+      max_tokens: 4096,
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: pngBase64 } },
+        { type: 'text', text: prompt },
+      ] }],
+      stream: true,
+    }, signal, 'Claude API');
+    for await (const line of readLines(response)) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(line.slice(6));
+        if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') emit(event.delta.text);
+      } catch {}
+    }
+    return text;
+  }
+  if (providerId === 'gemini') {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:streamGenerateContent?alt=sse`;
+    const response = await send(url, { 'x-goog-api-key': config.apiKey || '' }, {
+      contents: [{ role: 'user', parts: [{ inline_data: { mime_type: 'image/png', data: pngBase64 } }, { text: prompt }] }],
+    }, signal, 'Gemini');
+    for await (const line of readLines(response)) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        for (const part of JSON.parse(line.slice(6)).candidates?.[0]?.content?.parts || []) {
+          if (typeof part.text === 'string' && !part.thought) emit(part.text);
+        }
+      } catch {}
+    }
+    return text;
+  }
+  if (providerId === 'ollama') {
+    const response = await send(`${config.baseUrl || 'http://localhost:11434'}/api/chat`, {}, {
+      model: config.model,
+      messages: [{ role: 'user', content: prompt, images: [pngBase64] }],
+      stream: true,
+      options: { num_ctx: contextWindowTokens(config) },
+    }, signal, 'Ollama');
+    for await (const line of readLines(response)) {
+      if (!line.trim()) continue;
+      try { emit(JSON.parse(line).message?.content || ''); } catch {}
+    }
+    return text;
+  }
+  const url = providerId === 'openai' ? 'https://api.openai.com/v1/chat/completions' : buildOpenAICompatibleUrl(config.baseUrl || '');
+  const response = await send(url, { Authorization: `Bearer ${config.apiKey || ''}` }, {
+    model: config.model,
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: prompt },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${pngBase64}` } },
+    ] }],
+    stream: true,
+  }, signal, providerId === 'openai' ? 'OpenAI' : 'OpenAI-compatible API');
+  for await (const line of readLines(response)) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') break;
+    try { emit(JSON.parse(data).choices?.[0]?.delta?.content || ''); } catch {}
+  }
+  return text;
+}

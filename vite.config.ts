@@ -46,6 +46,18 @@ const pdfjsAssetsAndCsp: Plugin = {
         { recursive: true }
       );
     }
+    // OCR: Tesseract's worker, its WebAssembly cores (LSTM only; the worker
+    // picks relaxed-SIMD, SIMD or plain at run time) and English data.
+    const ocrDir = path.join(outDir, 'ocr');
+    fs.mkdirSync(ocrDir, { recursive: true });
+    fs.copyFileSync(path.resolve(__dirname, 'node_modules/tesseract.js/dist/worker.min.js'), path.join(ocrDir, 'worker.min.js'));
+    for (const core of ['tesseract-core-relaxedsimd-lstm.wasm.js', 'tesseract-core-simd-lstm.wasm.js', 'tesseract-core-lstm.wasm.js']) {
+      fs.copyFileSync(path.resolve(__dirname, 'node_modules/tesseract.js-core', core), path.join(ocrDir, core));
+    }
+    fs.copyFileSync(
+      path.resolve(__dirname, 'node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz'),
+      path.join(ocrDir, 'eng.traineddata.gz')
+    );
     // The embedding runtime loads this file at run time (see embedding-client.ts).
     fs.mkdirSync(path.join(outDir, 'ort'), { recursive: true });
     fs.copyFileSync(

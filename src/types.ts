@@ -186,6 +186,27 @@ export interface PageRange {
   endPage: number;
 }
 
+// Text recognized on a scanned page. Word boxes are relative to the page
+// (0-1, top-left origin) so they work at any zoom.
+export interface OcrWord {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  // Last word of a line.
+  lineEnd?: boolean;
+}
+
+export interface OcrPage {
+  text: string;
+  // Mean word confidence, 0-100 (Tesseract), or 100 for a vision model.
+  confidence: number;
+  words: OcrWord[];
+  // 'tesseract', or the vision model that transcribed the page.
+  engine: string;
+}
+
 // Text extraction state of a document tab.
 export type IndexStatus = 'idle' | 'extracting' | 'ready';
 
@@ -217,6 +238,8 @@ export interface AppSettings {
   flattenOnSave: boolean;
   // Deep mode: the model searches and reads the documents itself with tools.
   deepMode: boolean;
+  // Recognize text on scanned pages with Tesseract (English) on this computer.
+  ocrEnabled: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -286,4 +309,5 @@ export const DEFAULT_SETTINGS: AppSettings = {
   authorName: '',
   flattenOnSave: false,
   deepMode: false,
+  ocrEnabled: true,
 };

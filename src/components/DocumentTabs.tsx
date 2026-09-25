@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { Database, Download, FileText, Plus, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
-import { startEmbeddingDownload } from './DocumentIndexer';
+import { rereadPageWithModel, startEmbeddingDownload } from './DocumentIndexer';
+import { isLocalProvider } from '../providers/ai-providers';
+import { needsOcr } from '../utils/ocr';
 
 function statusColor(status: string): string {
   if (status === 'ready') return 'bg-emerald-400';
@@ -30,6 +32,10 @@ export default function DocumentTabs() {
     extractedPageCount,
     numPages,
     documentOutline,
+    currentPage,
+    ocrPages,
+    pageTexts,
+    providerConfig,
     embeddingStatus,
     embeddingProgress,
     semanticSearch,
@@ -44,6 +50,10 @@ export default function DocumentTabs() {
     extractedPageCount: state.extractedPageCount,
     numPages: state.numPages,
     documentOutline: state.documentOutline,
+    currentPage: state.currentPage,
+    ocrPages: state.ocrPages,
+    pageTexts: state.pageTexts,
+    providerConfig: state.settings.providers[state.settings.activeProvider],
     embeddingStatus: state.embeddingStatus,
     embeddingProgress: state.embeddingProgress,
     semanticSearch: state.settings.semanticSearch,
@@ -52,6 +62,7 @@ export default function DocumentTabs() {
     setCurrentPage: state.setCurrentPage,
   })));
   const [showIndex, setShowIndex] = useState(false);
+  const [rereading, setRereading] = useState<string | null>(null);
 
   useEffect(() => setShowIndex(false), [activeDocumentTabId]);
 
@@ -117,7 +128,7 @@ export default function DocumentTabs() {
         <Database size={13} />
         <span className={`h-1.5 w-1.5 rounded-full ${statusColor(indexStatus)}`} />
         <span className="hidden max-w-[180px] truncate xl:inline">
-          {indexStatus === 'extracting' ? statusText : `Text ready · ${numPages} pages`}
+          {indexStatus === 'extracting' ? statusText : `Text ready · ${numPages} page${numPages === 1 ? '' : 's'}`}
         </span>
       </button>
 
@@ -133,6 +144,40 @@ export default function DocumentTabs() {
             >
               <Download size={12} /> Download the 23 MB search model
             </button>
+          )}
+          {(ocrPages.has(currentPage) || (indexStatus === 'ready' && needsOcr(pageTexts.get(currentPage)))) && (
+            <div className="mt-3 rounded-lg border border-surface-3 bg-surface-2 px-2.5 py-2 text-xs text-text-secondary">
+              <div>
+                Page {currentPage}:{' '}
+                {ocrPages.get(currentPage)
+                  ? ocrPages.get(currentPage)!.engine === 'tesseract'
+                    ? `text recognized by OCR (${Math.round(ocrPages.get(currentPage)!.confidence)}% confidence)`
+                    : `text read by ${ocrPages.get(currentPage)!.engine}`
+                  : 'scanned, waiting for OCR'}
+              </div>
+              <button
+                disabled={Boolean(rereading) || !activeDocumentTabId}
+                onClick={async () => {
+                  if (!activeDocumentTabId) return;
+                  if (!isLocalProvider(providerConfig) && !window.confirm(
+                    `Send an image of page ${currentPage} to ${providerConfig.name} (${providerConfig.model}) to read its text?`
+                  )) return;
+                  setRereading(`Reading page ${currentPage}…`);
+                  try {
+                    await rereadPageWithModel(activeDocumentTabId, currentPage, new AbortController().signal);
+                    setRereading(null);
+                  } catch (error) {
+                    setRereading(error instanceof Error ? error.message : String(error));
+                    window.setTimeout(() => setRereading(null), 6000);
+                  }
+                }}
+                className="mt-1.5 rounded-md border border-accent/30 px-2 py-1 text-[11px] text-accent-light hover:bg-accent/10 disabled:opacity-50"
+                title="For tables, equations or poor scans. Needs a model that accepts images."
+              >
+                Re-read page {currentPage} with {providerConfig.model}
+              </button>
+              {rereading && <div className="mt-1 text-[11px] text-text-muted">{rereading}</div>}
+            </div>
           )}
           {documentOutline.length > 0 ? (
             <div className="mt-3 max-h-64 space-y-0.5 overflow-y-auto">

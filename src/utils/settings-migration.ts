@@ -139,5 +139,6 @@ export function normalizeSettings(raw: unknown): AppSettings {
     authorName: typeof source.authorName === 'string' ? source.authorName.slice(0, 120) : DEFAULT_SETTINGS.authorName,
     flattenOnSave: typeof source.flattenOnSave === 'boolean' ? source.flattenOnSave : DEFAULT_SETTINGS.flattenOnSave,
     deepMode: typeof source.deepMode === 'boolean' ? source.deepMode : DEFAULT_SETTINGS.deepMode,
+    ocrEnabled: typeof source.ocrEnabled === 'boolean' ? source.ocrEnabled : DEFAULT_SETTINGS.ocrEnabled,
   };
 }

@@ -296,7 +296,8 @@ export function retrieveContext(options: RetrievalOptions): RetrievalResult {
         currentLabel = block.label;
         body.push(`=== ${block.label}: ${byLabel.get(block.label)!.index.name} ===`);
       }
-      body.push(`[${block.label} p.${block.page}${block.section ? ` · ${block.section}` : ''}]\n${options.decorate ? options.decorate(block) : block.text}`);
+      const ocr = byLabel.get(block.label)!.index.ocrPages.has(block.page) ? ' · OCR text, may contain recognition errors' : '';
+      body.push(`[${block.label} p.${block.page}${block.section ? ` · ${block.section}` : ''}${ocr}]\n${options.decorate ? options.decorate(block) : block.text}`);
     }
     const pagesByLabel = new Map<string, number[]>();
     for (const block of finalBlocks) {
