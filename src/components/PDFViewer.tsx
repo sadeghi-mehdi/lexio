@@ -793,6 +793,20 @@ export default function PDFViewer() {
     }
   }, [currentPage, documentSessionId, pdfDocument, pageBaseSizes, numPages, zoom]);
 
+  // Outline a page briefly after a citation jump.
+  const flashPage = useStore((state) => state.flashPage);
+  useEffect(() => {
+    if (!flashPage) return;
+    const timer = window.setTimeout(() => {
+      const pageDiv = pagesRef.current.get(flashPage.page);
+      if (!pageDiv) return;
+      pageDiv.classList.remove('lexio-page-flash');
+      void pageDiv.offsetWidth;
+      pageDiv.classList.add('lexio-page-flash');
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [flashPage]);
+
   // ─── Intersection observer for page tracking ───
 
   useEffect(() => {

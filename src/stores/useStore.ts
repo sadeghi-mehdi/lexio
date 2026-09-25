@@ -53,9 +53,6 @@ export interface DocumentTabSession {
   activeTool: ToolType;
   undoStack: UndoAction[];
   redoStack: UndoAction[];
-  conversations: ChatConversation[];
-  activeConversation: string | null;
-  isStreaming: boolean;
   selectedTextForAI: string;
   selectedPageForAI: number;
   selectedEndPageForAI: number;
@@ -67,6 +64,9 @@ export interface DocumentTabSession {
 interface AppState {
   documentTabs: DocumentTabSession[];
   activeDocumentTabId: string | null;
+  // Open tab ids, most recently viewed first. A chat searches the first
+  // chatMaxDocuments of them.
+  recentTabIds: string[];
 
   // PDF
   pdfFile: PdfFileData | null;
@@ -101,6 +101,9 @@ interface AppState {
   indexStatus: IndexStatus;
   indexProgress: string;
 
+  // A page to outline briefly after a citation jump (token restarts the effect).
+  flashPage: { page: number; token: number } | null;
+
   // Meaning-based search (embedding model and document vectors)
   embeddingStatus: EmbeddingStatus;
   embeddingProgress: string;
@@ -129,6 +132,8 @@ interface AppState {
   setExtractionProgress: (pageCount: number, complete?: boolean, tabId?: string | null) => void;
   setDocumentOutline: (outline: OutlineEntry[], tabId?: string | null) => void;
   setEmbeddingState: (status: EmbeddingStatus, progress?: string) => void;
+  // Opens a document tab at a page and outlines the page briefly.
+  jumpToPage: (tabId: string, page: number) => void;
   setNumPages: (n: number) => void;
   setCurrentPage: (p: number) => void;
   setZoom: (z: number) => void;
@@ -155,10 +160,14 @@ interface AppState {
   setSelectedTextForAI: (text: string, page: number, rects?: RelativeRect[], endPage?: number) => void;
   clearSelectedTextForAI: () => void;
   newConversation: () => string;
-  addMessage: (convId: string, msg: ChatMessage, documentTabId?: string | null) => void;
-  updateLastAssistantMessage: (convId: string, content: string, documentTabId?: string | null) => void;
+  addMessage: (convId: string, msg: ChatMessage) => void;
+  updateLastAssistantMessage: (convId: string, content: string) => void;
+  // Merges fields into the newest assistant message (status, sources, ...).
+  patchLastAssistantMessage: (convId: string, patch: Partial<ChatMessage>) => void;
+  updateConversation: (convId: string, patch: Partial<ChatConversation>) => void;
+  setConversations: (conversations: ChatConversation[]) => void;
   setActiveConversation: (id: string | null) => void;
-  setIsStreaming: (v: boolean, documentTabId?: string | null) => void;
+  setIsStreaming: (v: boolean) => void;
   deleteConversation: (id: string) => void;
 
   // UI Actions
@@ -203,9 +212,6 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     activeTool: state.activeTool,
     undoStack: state.undoStack,
     redoStack: state.redoStack,
-    conversations: state.conversations,
-    activeConversation: state.activeConversation,
-    isStreaming: state.isStreaming,
     selectedTextForAI: state.selectedTextForAI,
     selectedPageForAI: state.selectedPageForAI,
     selectedEndPageForAI: state.selectedEndPageForAI,
@@ -234,9 +240,6 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     activeTool: 'select',
     undoStack: [],
     redoStack: [],
-    conversations: [],
-    activeConversation: null,
-    isStreaming: false,
     selectedTextForAI: '',
     selectedPageForAI: 0,
     selectedEndPageForAI: 0,
@@ -265,9 +268,6 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     activeTool: session.activeTool,
     undoStack: session.undoStack,
     redoStack: session.redoStack,
-    conversations: session.conversations,
-    activeConversation: session.activeConversation,
-    isStreaming: session.isStreaming,
     selectedTextForAI: session.selectedTextForAI,
     selectedPageForAI: session.selectedPageForAI,
     selectedEndPageForAI: session.selectedEndPageForAI,
@@ -278,6 +278,13 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
 }
 
 type TabFields = Omit<DocumentTabSession, 'id' | 'identity' | 'pdfFile'>;
+
+// Chat requests are no longer tied to a tab.
+export const WORKSPACE_CHAT = 'workspace';
+
+function markViewed(recent: readonly string[], id: string): string[] {
+  return [id, ...recent.filter((tabId) => tabId !== id)];
+}
 
 // Applies a change to one document tab. The active tab's fields live at the
 // top level of the state, other tabs' fields in documentTabs.
@@ -301,6 +308,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   documentTabs: [],
   activeDocumentTabId: null,
+  recentTabIds: [],
 
   pdfFile: null,
   documentSessionId: 0,
@@ -330,6 +338,7 @@ export const useStore = create<AppState>((set, get) => ({
   indexStatus: 'idle',
   indexProgress: '',
 
+  flashPage: null,
   embeddingStatus: 'unknown',
   embeddingProgress: '',
 
@@ -353,10 +362,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   setPdfFile: (file) => {
     if (!file) {
-      get().documentTabs.forEach((tab) => {
-        abortChatRequest(tab.id);
-        releaseRegisteredDocument(tab.id);
-      });
+      abortChatRequest(WORKSPACE_CHAT);
+      get().documentTabs.forEach((tab) => releaseRegisteredDocument(tab.id));
     }
     set((state) => {
     const captured = captureActiveSession(state);
@@ -367,6 +374,8 @@ export const useStore = create<AppState>((set, get) => ({
       return {
         documentTabs: [],
         activeDocumentTabId: null,
+        recentTabIds: [],
+        isStreaming: false,
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
@@ -381,9 +390,6 @@ export const useStore = create<AppState>((set, get) => ({
         annotations: [],
         undoStack: [],
         redoStack: [],
-        conversations: [],
-        activeConversation: null,
-        isStreaming: false,
         selectedTextForAI: '',
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
@@ -397,6 +403,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (existing) {
       return {
         documentTabs,
+        recentTabIds: markViewed(state.recentTabIds, existing.id),
         ...activateSession(existing, state.documentSessionId + 1),
       };
     }
@@ -404,6 +411,7 @@ export const useStore = create<AppState>((set, get) => ({
     documentTabs = [...documentTabs, session];
     return {
       documentTabs,
+      recentTabIds: markViewed(state.recentTabIds, session.id),
       ...activateSession(session, state.documentSessionId + 1),
     };
     });
@@ -418,11 +426,11 @@ export const useStore = create<AppState>((set, get) => ({
     if (!target) return state;
     return {
       documentTabs,
+      recentTabIds: markViewed(state.recentTabIds, id),
       ...activateSession(target, state.documentSessionId + 1),
     };
   }),
   closeDocumentTab: (id) => {
-    abortChatRequest(id);
     releaseRegisteredDocument(id);
     set((state) => {
       const captured = captureActiveSession(state);
@@ -432,17 +440,20 @@ export const useStore = create<AppState>((set, get) => ({
       const closingIndex = synchronizedTabs.findIndex((tab) => tab.id === id);
       if (closingIndex < 0) return state;
       const documentTabs = synchronizedTabs.filter((tab) => tab.id !== id);
-      if (id !== state.activeDocumentTabId) return { documentTabs };
+      const recentTabIds = state.recentTabIds.filter((tabId) => tabId !== id);
+      if (id !== state.activeDocumentTabId) return { documentTabs, recentTabIds };
       const nextTab = documentTabs[Math.min(closingIndex, documentTabs.length - 1)];
       if (nextTab) {
         return {
           documentTabs,
+          recentTabIds: markViewed(recentTabIds, nextTab.id),
           ...activateSession(nextTab, state.documentSessionId + 1),
         };
       }
       return {
         documentTabs: [],
         activeDocumentTabId: null,
+        recentTabIds: [],
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
@@ -456,9 +467,6 @@ export const useStore = create<AppState>((set, get) => ({
         annotations: [],
         undoStack: [],
         redoStack: [],
-        conversations: [],
-        activeConversation: null,
-        isStreaming: false,
         selectedTextForAI: '',
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
@@ -491,6 +499,10 @@ export const useStore = create<AppState>((set, get) => ({
   setDocumentOutline: (documentOutline, tabId) =>
     set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
   setEmbeddingState: (embeddingStatus, embeddingProgress = '') => set({ embeddingStatus, embeddingProgress }),
+  jumpToPage: (tabId, page) => {
+    if (get().activeDocumentTabId !== tabId) get().switchDocumentTab(tabId);
+    set((s) => ({ currentPage: page, flashPage: { page, token: (s.flashPage?.token || 0) + 1 } }));
+  },
   setNumPages: (n) => set({ numPages: n }),
   setCurrentPage: (p) => set({ currentPage: p }),
   setZoom: (z) => set({ zoom: Math.max(0.25, Math.min(5, z)) }),
@@ -619,11 +631,15 @@ export const useStore = create<AppState>((set, get) => ({
   }),
   newConversation: () => {
     const id = uid();
+    const now = Date.now();
     const conv: ChatConversation = {
       id,
       title: 'New Chat',
       messages: [],
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
+      documents: [],
+      scope: { mode: 'all', keys: [] },
     };
     set((s) => ({
       conversations: [...s.conversations, conv],
@@ -631,63 +647,50 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     return id;
   },
-  addMessage: (convId, msg, documentTabId) =>
-    set((s) => {
-      const targetTabId = documentTabId || s.activeDocumentTabId;
-      const addTo = (conversations: ChatConversation[]) => conversations.map((c) =>
+  addMessage: (convId, msg) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) =>
         c.id === convId
           ? {
               ...c,
               messages: [...c.messages, msg],
+              updatedAt: Date.now(),
               title:
                 c.messages.length === 0 && msg.role === 'user'
                   ? msg.content.slice(0, 60) + (msg.content.length > 60 ? '…' : '')
                   : c.title,
             }
           : c
-      );
-      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
-        return { conversations: addTo(s.conversations) };
-      }
-      return {
-        documentTabs: s.documentTabs.map((tab) =>
-          tab.id === targetTabId ? { ...tab, conversations: addTo(tab.conversations) } : tab
-        ),
-      };
-    }),
-  updateLastAssistantMessage: (convId, content, documentTabId) =>
-    set((s) => {
-      const targetTabId = documentTabId || s.activeDocumentTabId;
-      const update = (conversations: ChatConversation[]) => conversations.map((c) => {
+      ),
+    })),
+  updateLastAssistantMessage: (convId, content) => get().patchLastAssistantMessage(convId, { content }),
+  patchLastAssistantMessage: (convId, patch) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) => {
         if (c.id !== convId) return c;
         const msgs = [...c.messages];
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i].role === 'assistant') {
-            msgs[i] = { ...msgs[i], content };
+            msgs[i] = { ...msgs[i], ...patch };
             break;
           }
         }
         return { ...c, messages: msgs };
-      });
-      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
-        return { conversations: update(s.conversations) };
-      }
-      return {
-        documentTabs: s.documentTabs.map((tab) =>
-          tab.id === targetTabId ? { ...tab, conversations: update(tab.conversations) } : tab
-        ),
-      };
-    }),
+      }),
+    })),
+  updateConversation: (convId, patch) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === convId ? { ...c, ...patch } : c)),
+    })),
+  setConversations: (conversations) =>
+    set((s) => ({
+      conversations,
+      activeConversation: conversations.some((c) => c.id === s.activeConversation)
+        ? s.activeConversation
+        : conversations[conversations.length - 1]?.id || null,
+    })),
   setActiveConversation: (id) => set({ activeConversation: id }),
-  setIsStreaming: (v, documentTabId) => set((s) => {
-    const targetTabId = documentTabId || s.activeDocumentTabId;
-    if (!targetTabId || targetTabId === s.activeDocumentTabId) return { isStreaming: v };
-    return {
-      documentTabs: s.documentTabs.map((tab) =>
-        tab.id === targetTabId ? { ...tab, isStreaming: v } : tab
-      ),
-    };
-  }),
+  setIsStreaming: (v) => set({ isStreaming: v }),
   deleteConversation: (id) =>
     set((s) => {
       const removedIndex = s.conversations.findIndex((conversation) => conversation.id === id);

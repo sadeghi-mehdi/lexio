@@ -30,7 +30,6 @@ export default function DocumentTabs() {
     extractedPageCount,
     numPages,
     documentOutline,
-    isStreaming,
     embeddingStatus,
     embeddingProgress,
     semanticSearch,
@@ -45,7 +44,6 @@ export default function DocumentTabs() {
     extractedPageCount: state.extractedPageCount,
     numPages: state.numPages,
     documentOutline: state.documentOutline,
-    isStreaming: state.isStreaming,
     embeddingStatus: state.embeddingStatus,
     embeddingProgress: state.embeddingProgress,
     semanticSearch: state.settings.semanticSearch,
@@ -72,7 +70,6 @@ export default function DocumentTabs() {
         {documentTabs.map((tab) => {
           const active = tab.id === activeDocumentTabId;
           const tabStatus = active ? indexStatus : tab.indexStatus;
-          const tabIsStreaming = active ? isStreaming : tab.isStreaming;
           return (
             <div
               key={tab.id}
@@ -89,9 +86,6 @@ export default function DocumentTabs() {
               >
                 <FileText size={13} className="flex-shrink-0" />
                 <span className="truncate">{tab.pdfFile.name}</span>
-                {tabIsStreaming && (
-                  <span className="h-1.5 w-1.5 flex-shrink-0 animate-pulse rounded-full bg-accent-light" title="AI response in progress" />
-                )}
                 <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${statusColor(tabStatus)}`} />
               </button>
               <button

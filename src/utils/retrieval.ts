@@ -60,6 +60,9 @@ export interface RetrievalOptions {
   // (for example what the previous answer used).
   priority?: PassageRef[];
   reservedShare?: number;
+  // Turns a block's text into what the model sees (for example with the
+  // user's markings wrapped in tags).
+  decorate?: (block: ContextBlock) => string;
 }
 
 const COMPARISON = /\b(?:compare|comparison|contrast|differ(?:s|ence|ences|ent)?|versus|vs\.?|each (?:paper|document|study|pdf|report|article)|all (?:the )?(?:papers|documents|studies|pdfs|reports|articles)|both|across (?:the )?(?:papers|documents|studies)|similarit(?:y|ies)|in common)\b/i;
@@ -293,7 +296,7 @@ export function retrieveContext(options: RetrievalOptions): RetrievalResult {
         currentLabel = block.label;
         body.push(`=== ${block.label}: ${byLabel.get(block.label)!.index.name} ===`);
       }
-      body.push(`[${block.label} p.${block.page}${block.section ? ` · ${block.section}` : ''}]\n${block.text}`);
+      body.push(`[${block.label} p.${block.page}${block.section ? ` · ${block.section}` : ''}]\n${options.decorate ? options.decorate(block) : block.text}`);
     }
     const pagesByLabel = new Map<string, number[]>();
     for (const block of finalBlocks) {

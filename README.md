@@ -278,6 +278,14 @@ Document search:
 - Context budgets follow each model's context window. Ollama now receives `num_ctx`, and each provider has a context window setting.
 - The LLM-built page index was removed. Indexing no longer sends documents to an AI provider.
 
+Workspace chat:
+- Chats are no longer tied to one tab. A chat searches the open PDFs chosen with the chips above the input (by default the most recently viewed, up to a Settings limit of 1-50, default 10). Documents get labels (D1, D2, ...) that never change within a chat, and a question can name one with `@D2`.
+- Comparison questions give each document an equal share of the context.
+- Answers cite pages as `[D1 p.3]` and notes as `[D1 N2]`. Citations become chips that open the PDF at that page and outline it. A citation to a page that was not sent to the model is marked as unverified.
+- Memory: follow-up questions ("why?", "what about the second one?") reuse the previous question for search and the pages the previous answer used. Selected passages stay in the history. Failed and stopped answers are not sent back, and the history has its own token budget.
+- Your highlights, underlines, strikethroughs and comments are sent with questions, marked inline (`<mark>`, `<u>`, `<del>`, `<note>`) plus a list of all markings. Highlighted passages get extra weight in retrieval; strikethroughs get none. Each highlight color has an editable meaning in Settings.
+- Chats are saved and restored when the app starts. Markdown tables render in answers.
+
 ### Unreleased: Security and performance hardening
 
 Security:

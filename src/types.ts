@@ -77,6 +77,8 @@ export interface Highlight {
   type: AnnotationType;
   comment?: string;
   createdAt: number;
+  // Who wrote the comment. Missing means the user of this computer.
+  author?: string;
 }
 
 export interface Annotation {
@@ -107,6 +109,22 @@ export interface ProviderConfig {
   contextTokens?: number;
 }
 
+// A page that was sent to the model, for checking citations.
+export interface ContextSource {
+  label: string;
+  key: string;
+  page: number;
+}
+
+// A marking (highlight, note) that was sent to the model as N1, N2, ...
+export interface NoteReference {
+  ref: string;
+  label: string;
+  key: string;
+  page: number;
+  highlightId: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -115,8 +133,24 @@ export interface ChatMessage {
   selectedText?: string;
   pageNumber?: number;
   pageEndNumber?: number;
+  // Document of the selected passage (file hash or tab id) and its name.
+  documentKey?: string;
+  documentName?: string;
   providerId?: AIProvider;
   model?: string;
+  // Assistant messages: whether the answer finished, and what was sent.
+  status?: 'streaming' | 'done' | 'error' | 'aborted';
+  sources?: ContextSource[];
+  notes?: NoteReference[];
+  contextDescription?: string;
+}
+
+// A document a conversation has used, with the label it keeps in that
+// conversation (D1, D2, ...), even after its tab is closed.
+export interface ConversationDocument {
+  key: string;
+  name: string;
+  label: string;
 }
 
 export interface ChatConversation {
@@ -124,6 +158,11 @@ export interface ChatConversation {
   title: string;
   messages: ChatMessage[];
   createdAt: number;
+  updatedAt?: number;
+  documents?: ConversationDocument[];
+  // 'all': the most recently viewed open PDFs (up to the Settings limit).
+  // 'custom': only the listed document keys that are open.
+  scope?: { mode: 'all' | 'custom'; keys: string[] };
 }
 
 export interface PageRange {
@@ -147,6 +186,16 @@ export interface AppSettings {
   customInstructions: string;
   // Meaning-based search with a local embedding model, downloaded on first use.
   semanticSearch: boolean;
+  // Most open PDFs one chat searches at once (1-50).
+  chatMaxDocuments: number;
+  // Send the user's highlights and notes with questions.
+  includeNotes: boolean;
+  // Give passages the user marked extra weight in retrieval.
+  highlightWeight: boolean;
+  // What each highlight color means to the user; sent with each marking.
+  colorLabels: Record<HighlightColor, string>;
+  // Author written into annotations. Empty means the computer's user name.
+  authorName: string;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -203,4 +252,15 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxContextChars: 100000,
   customInstructions: '',
   semanticSearch: true,
+  chatMaxDocuments: 10,
+  includeNotes: true,
+  highlightWeight: true,
+  colorLabels: {
+    yellow: 'important',
+    green: 'use in my work',
+    blue: 'method or definition',
+    pink: 'disagree or question',
+    orange: 'follow up',
+  },
+  authorName: '',
 };

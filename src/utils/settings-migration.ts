@@ -4,6 +4,7 @@ import {
   type AIProvider,
   type AppSettings,
   type ContextMode,
+  type HighlightColor,
   type ProviderConfig,
 } from '../types.ts';
 
@@ -125,5 +126,16 @@ export function normalizeSettings(raw: unknown): AppSettings {
         : DEFAULT_SETTINGS.customInstructions,
     semanticSearch:
       typeof source.semanticSearch === 'boolean' ? source.semanticSearch : DEFAULT_SETTINGS.semanticSearch,
+    chatMaxDocuments: clampInteger(source.chatMaxDocuments, DEFAULT_SETTINGS.chatMaxDocuments, 1, 50),
+    includeNotes: typeof source.includeNotes === 'boolean' ? source.includeNotes : DEFAULT_SETTINGS.includeNotes,
+    highlightWeight:
+      typeof source.highlightWeight === 'boolean' ? source.highlightWeight : DEFAULT_SETTINGS.highlightWeight,
+    colorLabels: Object.fromEntries(
+      (Object.keys(DEFAULT_SETTINGS.colorLabels) as HighlightColor[]).map((color) => {
+        const labels = isRecord(source.colorLabels) ? source.colorLabels : {};
+        return [color, typeof labels[color] === 'string' ? (labels[color] as string).slice(0, 60) : DEFAULT_SETTINGS.colorLabels[color]];
+      })
+    ) as Record<HighlightColor, string>,
+    authorName: typeof source.authorName === 'string' ? source.authorName.slice(0, 120) : DEFAULT_SETTINGS.authorName,
   };
 }

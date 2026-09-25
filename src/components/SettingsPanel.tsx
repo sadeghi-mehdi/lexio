@@ -6,6 +6,14 @@ import { contextWindowTokens } from '../utils/context-budget';
 import type { AIProvider } from '../types';
 import { normalizeSettings } from '../utils/settings-migration';
 
+const COLOR_SWATCHES: Record<string, string> = {
+  yellow: '#ffeb3b',
+  green: '#4caf50',
+  blue: '#2196f3',
+  pink: '#e91e63',
+  orange: '#ff9800',
+};
+
 const PROVIDER_DOCS: Partial<Record<AIProvider, string>> = {
   ollama: 'https://ollama.com/download',
   claude: 'https://console.anthropic.com/settings/keys',
@@ -304,6 +312,69 @@ export default function SettingsPanel() {
                     Also find passages that match the meaning of a question, not only its words, using a small English model (23 MB) that runs on this computer. It is downloaded once when you ask for it in the document index panel. PDF text never leaves your computer for this.
                   </span>
                 </label>
+              </SettingField>
+
+              <SettingField label="PDFs one chat searches">
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={settings.chatMaxDocuments}
+                  onChange={(event) => {
+                    const value = Math.round(Number(event.target.value));
+                    if (Number.isFinite(value)) updateSettings({ chatMaxDocuments: Math.max(1, Math.min(50, value)) });
+                  }}
+                  className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors font-mono"
+                />
+                <p className="text-[11px] text-text-muted mt-1">
+                  A chat searches up to this many open PDFs (1-50), the most recently viewed first. Pick others with the document chips above the chat input.
+                </p>
+              </SettingField>
+
+              <SettingField label="Your highlights and notes">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.includeNotes}
+                    onChange={(event) => updateSettings({ includeNotes: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Send your highlights, underlines, strikethroughs and comments with questions, marked in the text so the AI can tell them apart from the authors' words.
+                  </span>
+                </label>
+                <label className="mt-2 flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.highlightWeight}
+                    onChange={(event) => updateSettings({ highlightWeight: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Give highlighted passages extra weight when choosing what to send. Strikethroughs get none.
+                  </span>
+                </label>
+              </SettingField>
+
+              <SettingField label="What your highlight colors mean">
+                <div className="space-y-1.5">
+                  {(Object.keys(settings.colorLabels) as Array<keyof typeof settings.colorLabels>).map((color) => (
+                    <div key={color} className="flex items-center gap-2">
+                      <span className={`h-3 w-3 flex-shrink-0 rounded-full highlight-swatch-${color}`} style={{ background: COLOR_SWATCHES[color] }} />
+                      <span className="w-14 text-xs capitalize text-text-muted">{color}</span>
+                      <input
+                        type="text"
+                        value={settings.colorLabels[color]}
+                        maxLength={60}
+                        onChange={(event) => updateSettings({ colorLabels: { ...settings.colorLabels, [color]: event.target.value } })}
+                        className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-2.5 py-1 text-xs text-text-primary outline-none focus:border-accent/40"
+                      />
+                    </div>
+                  ))}
+                </div>
+                <p className="text-[11px] text-text-muted mt-1">
+                  Sent with each marking, so you can ask things like "list everything I marked as disagree".
+                </p>
               </SettingField>
 
               <SettingField label="Maximum PDF context characters per request">
