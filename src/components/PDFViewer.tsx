@@ -3,6 +3,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react';
 import { useStore } from '../stores/useStore';
 import { openPdfDocument, pdfjsLib } from '../utils/pdfjs';
+import { ocrTextContent } from '../utils/ocr';
 import { loadRegisteredDocument } from '../utils/pdf-document-registry';
 import SelectionActionBar from './SelectionActionBar';
 import CommentModal from './CommentModal';
@@ -16,8 +17,8 @@ import { findDocumentMatches, type DocumentSearchMatch } from '../utils/document
 // current page. An A4 canvas at 2x DPR is about 8 MB, so keeping every page a
 // reader scrolls past would grow memory without bound.
 const KEEP_RENDERED_DISTANCE = 5;
-// Extracted page text is committed to the store in batches of this size.
-const EXTRACTION_BATCH = 25;
+// File annotations that Lexio lists and may hide from pdf.js rendering.
+const HIDEABLE_SUBTYPES = new Set(['Highlight', 'Underline', 'Squiggly', 'StrikeOut', 'Text', 'FreeText']);
 const SEARCH_DEBOUNCE_MS = 150;
 const WHEEL_ZOOM_SETTLE_MS = 150;
 
@@ -270,10 +271,10 @@ export default function PDFViewer() {
   const activeSearchMatchRef = useRef<DocumentSearchMatch | null>(null);
 
   const {
-    hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts,
+    hasPdf, activeDocumentTabId, documentSessionId, zoom, currentPage, numPages, pageTexts, ocrPages,
     highlights, activeTool, activeHighlightColor,
-    setNumPages, setCurrentPage, mergePageTexts, addHighlight,
-    setExtractionProgress, setSelectedTextForAI, clearSelectedTextForAI,
+    setNumPages, setCurrentPage, addHighlight,
+    setSelectedTextForAI, clearSelectedTextForAI,
     setSidebarOpen, setSidebarTab,
   } = useStore(useShallow((state) => ({
     hasPdf: Boolean(state.pdfFile),
@@ -283,14 +284,13 @@ export default function PDFViewer() {
     currentPage: state.currentPage,
     numPages: state.numPages,
     pageTexts: state.pageTexts,
+    ocrPages: state.ocrPages,
     highlights: state.highlights,
     activeTool: state.activeTool,
     activeHighlightColor: state.activeHighlightColor,
     setNumPages: state.setNumPages,
     setCurrentPage: state.setCurrentPage,
-    mergePageTexts: state.mergePageTexts,
     addHighlight: state.addHighlight,
-    setExtractionProgress: state.setExtractionProgress,
     setSelectedTextForAI: state.setSelectedTextForAI,
     clearSelectedTextForAI: state.clearSelectedTextForAI,
     setSidebarOpen: state.setSidebarOpen,
@@ -473,7 +473,8 @@ export default function PDFViewer() {
     pageNum: number, pageDiv: HTMLDivElement, pageWidth: number, pageHeight: number
   ) => {
     pageDiv.querySelectorAll('.highlight-layer').forEach(el => el.remove());
-    const pageHighlights = highlights.filter(h => h.page === pageNum);
+    // Notes (sticky notes, text boxes) have no marked text; pdf.js draws them.
+    const pageHighlights = highlights.filter(h => h.page === pageNum && h.type !== 'note');
     if (pageHighlights.length === 0) return;
 
     const highlightLayer = document.createElement('div');
@@ -535,7 +536,6 @@ export default function PDFViewer() {
     const stillCurrent = () => !cancelled && viewerIsActive();
 
     const loadPdf = async () => {
-      const textAlreadyExtracted = useStore.getState().documentTextReady;
       // The parsed document is shared with the thumbnail sidebar and survives
       // tab switches, so switching back to a tab does not parse the file again.
       const doc = await loadRegisteredDocument(viewerTabId, () => openPdfDocument(pdfFile.data));
@@ -558,42 +558,20 @@ export default function PDFViewer() {
       setPageBaseSizes(sizes);
       setPdfDocument(doc);
       setNumPages(doc.numPages);
-      if (sizesKnown && textAlreadyExtracted) return;
+      if (sizesKnown) return;
 
-      // One background pass reads each page once for both its real size and
-      // (on first open) its text. Text is committed in batches so the store
-      // and its subscribers update once per batch, not once per page.
+      // One background pass reads each page's real size. Text is extracted
+      // separately for every open tab by DocumentIndexer.
       const actualSizes = new Map(sizes);
       let sizesChanged = false;
-      let batch: Array<[number, string]> = [];
       for (let i = 1; i <= doc.numPages; i++) {
         if (!stillCurrent()) return;
         const page = await doc.getPage(i);
-        if (!sizesKnown) {
-          const viewport = page.getViewport({ scale: 1 });
-          const assumed = actualSizes.get(i);
-          if (!assumed || assumed.width !== viewport.width || assumed.height !== viewport.height) {
-            actualSizes.set(i, { width: viewport.width, height: viewport.height });
-            sizesChanged = true;
-          }
-        }
-        if (!textAlreadyExtracted) {
-          const textContent = await loadTextContent(page);
-          if (!stillCurrent()) return;
-          batch.push([i, textContent.items
-            .map((item: any) => `${item.str || ''}${item.hasEOL ? '\n' : ' '}`)
-            .join('')
-            .replace(/[ \t]+\n/g, '\n')
-            .trim()]);
-          // Keep the text content only if the page is about to be rendered.
-          if (Math.abs(i - useStore.getState().currentPage) > KEEP_RENDERED_DISTANCE) {
-            textContentCacheRef.current.delete(i);
-          }
-          if (batch.length >= EXTRACTION_BATCH || i === doc.numPages) {
-            mergePageTexts(batch);
-            setExtractionProgress(i, i === doc.numPages);
-            batch = [];
-          }
+        const viewport = page.getViewport({ scale: 1 });
+        const assumed = actualSizes.get(i);
+        if (!assumed || assumed.width !== viewport.width || assumed.height !== viewport.height) {
+          actualSizes.set(i, { width: viewport.width, height: viewport.height });
+          sizesChanged = true;
         }
       }
       if (!stillCurrent()) return;
@@ -607,7 +585,7 @@ export default function PDFViewer() {
       cancelled = true;
       pdfDocRef.current = null;
     };
-  }, [activeDocumentTabId, documentSessionId, setNumPages, mergePageTexts, setExtractionProgress, loadTextContent]);
+  }, [activeDocumentTabId, documentSessionId, setNumPages]);
 
   // Cancel in-flight renders when the viewer unmounts (tab switch or close).
   // The parsed document itself stays in the registry until its tab closes.
@@ -638,10 +616,14 @@ export default function PDFViewer() {
   useEffect(() => {
     if (!pdfDocument || numPages === 0 || pageBaseSizes.size !== numPages) return;
 
-    const renderSignature = `${documentSessionId}:${zoom}`;
+    const baseSignature = `${documentSessionId}:${zoom}`;
 
     const renderPage = async (pageNum: number) => {
       const doc = pdfDocument;
+      // A page re-renders when OCR text arrives for it, so its text layer
+      // (selection, highlights, Find) uses the recognized words.
+      const ocr = ocrPages.get(pageNum);
+      const renderSignature = `${baseSignature}${ocr?.words.length ? ':ocr' : ''}`;
       if (pdfDocRef.current !== doc || renderedPagesRef.current.get(pageNum) === renderSignature) return;
       const existing = renderTasksRef.current.get(pageNum);
       if (existing) { try { existing.cancel(); } catch {} }
@@ -669,9 +651,25 @@ export default function PDFViewer() {
       canvas.style.height = `${viewport.height}px`;
       pageDiv.appendChild(canvas);
 
+      // Highlights, underlines and strikethroughs read from the file are drawn
+      // by Lexio's overlay (so they can be edited and deleted); pdf.js must
+      // not draw them too. Notes deleted in Lexio are hidden until saved.
+      const fileAnnotations = await page.getAnnotations();
+      const listed = new Map(useStore.getState().highlights.filter((h) => h.pdfRef).map((h) => [h.pdfRef!, h]));
+      for (const annotation of fileAnnotations) {
+        if (!HIDEABLE_SUBTYPES.has(annotation.subtype) || annotation.inReplyTo) continue;
+        const highlight = listed.get(annotation.id);
+        doc.annotationStorage.setValue(annotation.id, { noView: !highlight || highlight.type !== 'note' });
+      }
+      if (pdfDocRef.current !== doc || pagesRef.current.get(pageNum) !== pageDiv || !pageDiv.isConnected) return;
+
       const ctx = canvas.getContext('2d')!;
       const renderViewport = page.getViewport({ scale: zoom * dpr });
-      const renderTask = page.render({ canvasContext: ctx, viewport: renderViewport });
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport: renderViewport,
+        annotationMode: pdfjsLib.AnnotationMode.ENABLE_STORAGE,
+      });
       renderTasksRef.current.set(pageNum, renderTask);
       try {
         await renderTask.promise;
@@ -681,7 +679,9 @@ export default function PDFViewer() {
           !pageDiv.isConnected
         ) return;
 
-        const textContent = await loadTextContent(page);
+        const textContent = ocr?.words.length
+          ? (ocrTextContent(ocr, page.getViewport({ scale: 1 })) as unknown as TextContent)
+          : await loadTextContent(page);
         if (
           pdfDocRef.current !== doc ||
           pagesRef.current.get(pageNum) !== pageDiv ||
@@ -750,6 +750,7 @@ export default function PDFViewer() {
       });
     }
   }, [
+    ocrPages,
     pdfDocument,
     pageBaseSizes,
     documentSessionId,
@@ -819,6 +820,20 @@ export default function PDFViewer() {
       scrolledPageRef.current = currentPage;
     }
   }, [currentPage, documentSessionId, pdfDocument, pageBaseSizes, numPages, zoom]);
+
+  // Outline a page briefly after a citation jump.
+  const flashPage = useStore((state) => state.flashPage);
+  useEffect(() => {
+    if (!flashPage) return;
+    const timer = window.setTimeout(() => {
+      const pageDiv = pagesRef.current.get(flashPage.page);
+      if (!pageDiv) return;
+      pageDiv.classList.remove('lexio-page-flash');
+      void pageDiv.offsetWidth;
+      pageDiv.classList.add('lexio-page-flash');
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [flashPage]);
 
   // ─── Intersection observer for page tracking ───
 

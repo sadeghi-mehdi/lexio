@@ -1,14 +1,14 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, safeStorage, session, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu, net, safeStorage, session, shell } from 'electron';
 import * as path from 'path';
 import { promises as fs } from 'fs';
 import { createHash, randomUUID } from 'crypto';
+import os from 'os';
 import { mergeSettingsApiKeys, splitSettingsApiKeys } from './credential-settings';
 
 let mainWindow: BrowserWindow | null = null;
 
 const DIST = path.join(__dirname, '../dist');
 const PRELOAD = path.join(__dirname, 'preload.js');
-const MAX_DIGEST_BYTES = 20 * 1024 * 1024;
 
 // The renderer never receives a writable path. Every PDF the user opens through
 // the dialog or a real drag-and-drop gets an opaque id, and in-place saves are
@@ -367,37 +367,133 @@ ipcMain.handle('settings:save', async (_event, settings: unknown) => {
 
 ipcMain.handle('settings:credential-status', () => credentialStatus());
 
-async function digestPath(fingerprint: unknown): Promise<string> {
-  if (typeof fingerprint !== 'string' || !/^[a-f0-9]{64}$/i.test(fingerprint)) {
-    throw new Error('Invalid document fingerprint');
-  }
-  const directory = path.join(app.getPath('userData'), 'digests');
+// Per-document data (extracted text, notes, chats, embeddings, OCR results),
+// stored as one JSON file per kind and key in the app data folder. Keys are
+// SHA-256 file hashes (or a hash of several for chats spanning documents),
+// so the renderer can never choose a path.
+const LIBRARY_KINDS = new Set(['text', 'notes', 'chats', 'cards', 'embeddings', 'ocr']);
+const MAX_LIBRARY_BYTES = 80 * 1024 * 1024;
+
+async function libraryPath(kind: unknown, key: unknown): Promise<string> {
+  if (typeof kind !== 'string' || !LIBRARY_KINDS.has(kind)) throw new Error('Invalid data kind');
+  if (typeof key !== 'string' || !/^[a-f0-9]{64}$/i.test(key)) throw new Error('Invalid document key');
+  const directory = path.join(app.getPath('userData'), 'library', kind);
   await fs.mkdir(directory, { recursive: true });
-  return path.join(directory, `${fingerprint.toLowerCase()}.json`);
+  return path.join(directory, `${key.toLowerCase()}.json`);
 }
 
-ipcMain.handle('digest:load', async (_event, fingerprint: unknown) => {
+ipcMain.handle('library:load', async (_event, kind: unknown, key: unknown) => {
   try {
-    return JSON.parse(await fs.readFile(await digestPath(fingerprint), 'utf-8'));
+    return JSON.parse(await fs.readFile(await libraryPath(kind, key), 'utf-8'));
   } catch {
     return null;
   }
 });
 
-ipcMain.handle('digest:save', async (_event, fingerprint: unknown, digest: unknown) => {
-  const serialized = JSON.stringify(digest);
-  if (typeof serialized !== 'string' || serialized.length > MAX_DIGEST_BYTES) {
-    throw new Error('Digest is too large to cache.');
+ipcMain.handle('library:save', async (_event, kind: unknown, key: unknown, data: unknown) => {
+  const serialized = JSON.stringify(data);
+  if (typeof serialized !== 'string' || serialized.length > MAX_LIBRARY_BYTES) {
+    throw new Error('Document data is too large to save.');
   }
-  await writeAtomically(await digestPath(fingerprint), serialized);
+  await writeAtomically(await libraryPath(kind, key), serialized);
 });
 
-ipcMain.handle('digest:delete', async (_event, fingerprint: unknown) => {
+ipcMain.handle('library:delete', async (_event, kind: unknown, key: unknown) => {
   try {
-    await fs.unlink(await digestPath(fingerprint));
+    await fs.unlink(await libraryPath(kind, key));
   } catch (error: any) {
     if (error?.code !== 'ENOENT') throw error;
   }
+});
+
+// The computer's user name, the default author of new annotations.
+ipcMain.handle('app:user-name', () => {
+  try {
+    return os.userInfo().username;
+  } catch {
+    return '';
+  }
+});
+
+// ─── Embedding model (downloaded on first use) ───
+
+// Files of Xenova/all-MiniLM-L6-v2 from Hugging Face, pinned by SHA-256. A
+// file whose hash differs is deleted and never loaded, so a changed or
+// tampered upstream file fails loudly instead of being used.
+const EMBEDDING_FILES = [
+  {
+    name: 'model_quantized.onnx',
+    url: 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_quantized.onnx',
+    sha256: 'afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1',
+  },
+  {
+    name: 'tokenizer.json',
+    url: 'https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/tokenizer.json',
+    sha256: 'da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0',
+  },
+];
+
+function embeddingDirectory(): string {
+  return path.join(app.getPath('userData'), 'models', 'all-MiniLM-L6-v2');
+}
+
+async function verifiedFile(name: string, sha256: string): Promise<Buffer | null> {
+  try {
+    const data = await fs.readFile(path.join(embeddingDirectory(), name));
+    return createHash('sha256').update(data).digest('hex') === sha256 ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+let embeddingDownload: Promise<void> | null = null;
+
+ipcMain.handle('embedding:status', async () => {
+  for (const file of EMBEDDING_FILES) {
+    if (!(await verifiedFile(file.name, file.sha256))) return { installed: false, downloading: Boolean(embeddingDownload) };
+  }
+  return { installed: true, downloading: false };
+});
+
+ipcMain.handle('embedding:download', async (event) => {
+  embeddingDownload ??= (async () => {
+    await fs.mkdir(embeddingDirectory(), { recursive: true });
+    for (const file of EMBEDDING_FILES) {
+      if (await verifiedFile(file.name, file.sha256)) continue;
+      const response = await net.fetch(file.url);
+      if (!response.ok || !response.body) throw new Error(`Download failed (${response.status}) for ${file.name}`);
+      const total = Number(response.headers.get('content-length')) || 0;
+      const hash = createHash('sha256');
+      const chunks: Buffer[] = [];
+      let received = 0;
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value);
+        hash.update(chunk);
+        chunks.push(chunk);
+        received += chunk.length;
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('embedding:progress', { file: file.name, received, total });
+        }
+      }
+      if (hash.digest('hex') !== file.sha256) {
+        throw new Error(`${file.name} does not match the expected SHA-256. It was not saved.`);
+      }
+      await writeAtomically(path.join(embeddingDirectory(), file.name), Buffer.concat(chunks));
+    }
+  })().finally(() => {
+    embeddingDownload = null;
+  });
+  await embeddingDownload;
+});
+
+ipcMain.handle('embedding:load', async () => {
+  const model = await verifiedFile(EMBEDDING_FILES[0].name, EMBEDDING_FILES[0].sha256);
+  const tokenizer = await verifiedFile(EMBEDDING_FILES[1].name, EMBEDDING_FILES[1].sha256);
+  if (!model || !tokenizer) return null;
+  return { model: new Uint8Array(model), tokenizer: tokenizer.toString('utf-8') };
 });
 
 // ─── Navigation and window hardening ───

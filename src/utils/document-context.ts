@@ -68,8 +68,11 @@ function documentCharacterCount(pages: Array<[number, string]>): number {
 
 export function isWholeDocumentRequest(query: string): boolean {
   const normalized = query.toLowerCase().replace(/\s+/g, ' ').trim();
-  if (/\bliterature\b/.test(normalized)) return true;
   return [
+    // "Review the literature ..." or a request for research gaps, but not a
+    // question about a document's literature review section.
+    /^(?:please )?(?:review|survey|synthesi[sz]e|summari[sz]e) (?:the |this )?literature\b/,
+    /\b(?:identify|find|list) (?:the )?(?:research |knowledge )?gaps\b/,
     /summari[sz]e (?:the |this )?(?:entire|whole|full) (?:pdf|document|report|paper)/,
     /summari[sz]e (?:the |this )?(?:pdf|document|report|paper)\b/,
     /(?:overall|complete) summary/,

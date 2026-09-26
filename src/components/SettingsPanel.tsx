@@ -2,8 +2,17 @@ import { useEffect, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { X, Eye, EyeOff, Check, ExternalLink } from 'lucide-react';
 import { useStore } from '../stores/useStore';
+import { contextWindowTokens } from '../utils/context-budget';
 import type { AIProvider } from '../types';
 import { normalizeSettings } from '../utils/settings-migration';
+
+const COLOR_SWATCHES: Record<string, string> = {
+  yellow: '#ffeb3b',
+  green: '#4caf50',
+  blue: '#2196f3',
+  pink: '#e91e63',
+  orange: '#ff9800',
+};
 
 const PROVIDER_DOCS: Partial<Record<AIProvider, string>> = {
   ollama: 'https://ollama.com/download',
@@ -38,17 +47,13 @@ export default function SettingsPanel() {
     window.electronAPI?.credentialStatus().then(setCredentialStatus).catch(() => {});
   }, []);
   const [activeTab, setActiveTab] = useState<AIProvider>(settings.activeProvider);
+  const [userName, setUserName] = useState('');
+  useEffect(() => {
+    window.electronAPI?.userName().then(setUserName).catch(() => {});
+  }, []);
   const [showKey, setShowKey] = useState(false);
-  const [customDigestProvider, setCustomDigestProvider] = useState<AIProvider | null>(null);
 
   const provider = settings.providers[activeTab];
-  const effectiveDigestProviderId = settings.digestProvider === 'active'
-    ? settings.activeProvider
-    : settings.digestProvider;
-  const digestModelOverride = settings.digestModels[activeTab] || '';
-  const digestUsesCustomModel = customDigestProvider === activeTab || (
-    Boolean(digestModelOverride) && !provider.models.includes(digestModelOverride)
-  );
 
   const handleSave = () => {
     const normalized = normalizeSettings(settings);
@@ -253,11 +258,31 @@ export default function SettingsPanel() {
               </p>
             </SettingField>
 
+            <SettingField label="Context window (tokens)">
+              <input
+                type="number"
+                min={0}
+                step={1024}
+                value={provider.contextTokens || ''}
+                placeholder={`Automatic (${contextWindowTokens({ ...provider, contextTokens: 0 }).toLocaleString()})`}
+                onChange={(e) => {
+                  const value = Math.max(0, Math.round(Number(e.target.value) || 0));
+                  updateProviderConfig(activeTab, { contextTokens: value });
+                }}
+                className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors font-mono"
+              />
+              <p className="text-[11px] text-text-muted mt-1">
+                {activeTab === 'ollama'
+                  ? 'Sent to Ollama as num_ctx. Larger values let more of the PDF fit but need more memory.'
+                  : 'Leave empty to use the known size for this model. Lexio fits the PDF text, chat history and answer inside it.'}
+              </p>
+            </SettingField>
+
             <div className="border-t border-surface-3 pt-5 space-y-5">
               <div>
                 <h3 className="text-sm font-semibold text-text-primary">Document context</h3>
                 <p className="text-xs text-text-muted mt-1">
-                  Ask AI uses only the selected passage. Typed questions use original PDF text selected with the page index, or raw mode below.
+                  Ask AI uses only the selected passage. Typed questions send the whole PDF when it fits the model, and otherwise the most relevant passages of the original text.
                 </p>
               </div>
 
@@ -269,7 +294,7 @@ export default function SettingsPanel() {
                   }
                   className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors"
                 >
-                  <option value="documentAware">Document-aware — page index + original source pages</option>
+                  <option value="documentAware">Document-aware — whole PDF when it fits, else relevant passages</option>
                   <option value="rawEntire">Raw full document — resend or resummarize every request</option>
                 </select>
                 {settings.contextMode === 'rawEntire' && (
@@ -279,130 +304,124 @@ export default function SettingsPanel() {
                 )}
               </SettingField>
 
-              <SettingField label="Reusable page index">
+              <SettingField label="Scanned PDFs">
                 <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
                   <input
                     type="checkbox"
-                    checked={settings.digestEnabled}
-                    onChange={(event) => updateSettings({ digestEnabled: event.target.checked })}
+                    checked={settings.ocrEnabled}
+                    onChange={(event) => updateSettings({ ocrEnabled: event.target.checked })}
                     className="mt-0.5 accent-accent"
                   />
                   <span className="text-xs text-text-secondary">
-                    Build once and cache headings, section titles, descriptions, and up to 20 keywords per page. Answers use original PDF text, not the index.
+                    Recognize text on scanned pages (OCR, English) on this computer, so they can be searched, selected, highlighted and asked about. A page can also be re-read with the chat's vision model from the document index panel.
                   </span>
                 </label>
-                {settings.digestEnabled && (
-                  <label className="mt-2 flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
-                    <input
-                      type="checkbox"
-                      checked={settings.digestAutoCloud}
-                      onChange={(event) => updateSettings({ digestAutoCloud: event.target.checked })}
-                      className="mt-0.5 accent-accent"
-                    />
-                    <span className="text-xs text-text-secondary">
-                      Build page indexes with cloud providers without asking. When off, Lexio asks before sending a document's full text to a cloud provider. Local providers never ask.
-                    </span>
-                  </label>
-                )}
               </SettingField>
 
-              {settings.digestEnabled && (
-                <>
-                  <SettingField label={`Page indexing with ${provider.name}`}>
-                    <label className="flex items-center justify-between gap-4 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2.5">
-                      <span className="text-xs text-text-secondary">
-                        Use {provider.name} to build the reusable page index
-                      </span>
+              <SettingField label="Meaning-based search">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.semanticSearch}
+                    onChange={(event) => updateSettings({ semanticSearch: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Also find passages that match the meaning of a question, not only its words, using a small English model (23 MB) that runs on this computer. It is downloaded once when you ask for it in the document index panel. PDF text never leaves your computer for this.
+                  </span>
+                </label>
+              </SettingField>
+
+              <SettingField label="PDFs one chat searches">
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={settings.chatMaxDocuments}
+                  onChange={(event) => {
+                    const value = Math.round(Number(event.target.value));
+                    if (Number.isFinite(value)) updateSettings({ chatMaxDocuments: Math.max(1, Math.min(50, value)) });
+                  }}
+                  className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors font-mono"
+                />
+                <p className="text-[11px] text-text-muted mt-1">
+                  A chat searches up to this many open PDFs (1-50), the most recently viewed first. Pick others with the document chips above the chat input.
+                </p>
+              </SettingField>
+
+              <SettingField label="Your highlights and notes">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.includeNotes}
+                    onChange={(event) => updateSettings({ includeNotes: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Send your highlights, underlines, strikethroughs and comments with questions, marked in the text so the AI can tell them apart from the authors' words.
+                  </span>
+                </label>
+                <label className="mt-2 flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.highlightWeight}
+                    onChange={(event) => updateSettings({ highlightWeight: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Give highlighted passages extra weight when choosing what to send. Strikethroughs get none.
+                  </span>
+                </label>
+              </SettingField>
+
+              <SettingField label="What your highlight colors mean">
+                <div className="space-y-1.5">
+                  {(Object.keys(settings.colorLabels) as Array<keyof typeof settings.colorLabels>).map((color) => (
+                    <div key={color} className="flex items-center gap-2">
+                      <span className={`h-3 w-3 flex-shrink-0 rounded-full highlight-swatch-${color}`} style={{ background: COLOR_SWATCHES[color] }} />
+                      <span className="w-14 text-xs capitalize text-text-muted">{color}</span>
                       <input
-                        type="radio"
-                        name="page-index-provider"
-                        checked={effectiveDigestProviderId === activeTab}
-                        onChange={() => updateSettings({ digestProvider: activeTab })}
-                        className="accent-accent"
-                        aria-label={`Use ${provider.name} for page indexing`}
+                        type="text"
+                        value={settings.colorLabels[color]}
+                        maxLength={60}
+                        onChange={(event) => updateSettings({ colorLabels: { ...settings.colorLabels, [color]: event.target.value } })}
+                        className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-2.5 py-1 text-xs text-text-primary outline-none focus:border-accent/40"
                       />
-                    </label>
-                    <p className="mt-1 text-[11px] text-text-muted">
-                      {effectiveDigestProviderId === activeTab
-                        ? `${provider.name} is the current page-index provider.`
-                        : `${settings.providers[effectiveDigestProviderId].name} is currently used. Select this option to switch.`}
-                    </p>
-                  </SettingField>
-
-                  <SettingField label={`${provider.name} page-index model`}>
-                    <div className="flex gap-2">
-                      <select
-                        value={digestUsesCustomModel
-                          ? '__custom__'
-                          : digestModelOverride || '__main__'}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          if (value === '__custom__') {
-                            setCustomDigestProvider(activeTab);
-                            return;
-                          }
-                          setCustomDigestProvider(null);
-                          updateSettings({
-                            digestModels: {
-                              ...settings.digestModels,
-                              [activeTab]: value === '__main__' ? '' : value,
-                            },
-                          });
-                        }}
-                        className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40"
-                      >
-                        <option value="__main__">Use main model — {provider.model}</option>
-                        {provider.models.map((model) => (
-                          <option key={model} value={model}>{model}</option>
-                        ))}
-                        <option value="__custom__">Custom model…</option>
-                      </select>
-                      {digestUsesCustomModel && (
-                        <input
-                          type="text"
-                          autoFocus={customDigestProvider === activeTab}
-                          value={digestModelOverride}
-                          onChange={(event) => updateSettings({
-                            digestModels: {
-                              ...settings.digestModels,
-                              [activeTab]: event.target.value,
-                            },
-                          })}
-                          placeholder="Exact custom model ID"
-                          className="flex-1 bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                        />
-                      )}
                     </div>
-                    <p className="mt-1 text-[11px] text-text-muted">
-                      This list uses {provider.name}'s presets. Choose Custom model to enter another exact model ID. Changes apply when the page index is rebuilt.
-                    </p>
-                  </SettingField>
+                  ))}
+                </div>
+                <p className="text-[11px] text-text-muted mt-1">
+                  Sent with each marking, so you can ask things like "list everything I marked as disagree".
+                </p>
+              </SettingField>
 
-                  <SettingField label="Page-index chunk characters">
-                    <input
-                      type="number"
-                      min={10000}
-                      max={200000}
-                      step={5000}
-                      value={settings.digestChunkChars}
-                      onChange={(event) => updateSettings({ digestChunkChars: Number(event.target.value) })}
-                      className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                    />
-                  </SettingField>
+              <SettingField label="Your name on annotations">
+                <input
+                  type="text"
+                  value={settings.authorName}
+                  maxLength={120}
+                  placeholder={userName ? `Computer user name (${userName})` : 'Computer user name'}
+                  onChange={(event) => updateSettings({ authorName: event.target.value })}
+                  className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 transition-colors"
+                />
+                <p className="text-[11px] text-text-muted mt-1">
+                  Written as the author of highlights and comments you save into PDFs, so other readers show who made them.
+                </p>
+              </SettingField>
 
-                  <SettingField label="Maximum retrieved page ranges">
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      value={settings.maxRetrievedRanges}
-                      onChange={(event) => updateSettings({ maxRetrievedRanges: Number(event.target.value) })}
-                      className="w-full bg-surface-2 border border-surface-3 rounded-lg px-3 py-2 text-sm text-text-primary outline-none focus:border-accent/40 font-mono"
-                    />
-                  </SettingField>
-
-                </>
-              )}
+              <SettingField label="Saving annotations">
+                <label className="flex items-start gap-2 rounded-lg border border-surface-3 bg-surface-2 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={settings.flattenOnSave}
+                    onChange={(event) => updateSettings({ flattenOnSave: event.target.checked })}
+                    className="mt-0.5 accent-accent"
+                  />
+                  <span className="text-xs text-text-secondary">
+                    Flatten: draw new highlights into the page instead of saving them as annotations. Use this for printing or for readers that ignore annotations. Flattened highlights can no longer be edited or removed, in Lexio or elsewhere.
+                  </span>
+                </label>
+              </SettingField>
 
               <SettingField label="Maximum PDF context characters per request">
                 <input

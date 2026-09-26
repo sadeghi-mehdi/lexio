@@ -12,101 +12,77 @@ import {
   FileText,
   Copy,
   Check,
+  StickyNote,
+  Layers,
+  Telescope,
 } from 'lucide-react';
-import { useStore } from '../stores/useStore';
-import { providers, type AIProviderInterface } from '../providers/ai-providers';
-import type { ChatMessage, AIProvider, ProviderConfig } from '../types';
-import {
-  buildContextSystemPrompt,
-  buildDocumentContext,
-  chooseDocumentAwareStrategy,
-  chunkDocument,
-  groupTextsWithinBudget,
-} from '../utils/document-context';
-import { retrieveDigestContext } from '../utils/document-digest';
+import { useStore, WORKSPACE_CHAT, type DocumentTabSession } from '../stores/useStore';
+import { providers } from '../providers/ai-providers';
+import type { ChatMessage, AIProvider, ChatConversation, ConversationDocument } from '../types';
 import { requestProviderText } from '../utils/provider-request';
+import { abortChatRequest, clearChatRequest, registerChatRequest } from '../utils/chat-request-registry';
+import { documentVectors, embedQuery } from '../utils/embedding-client';
+import { renderCitations } from '../utils/citations';
+import { loadLibrary, saveLibrary } from '../utils/library-store';
 import {
-  abortChatRequest,
-  clearChatRequest,
-  registerChatRequest,
-} from '../utils/chat-request-registry';
+  assignLabels,
+  documentsInScope,
+  prepareAnalysis,
+  prepareRequest,
+  type OpenDocument,
+} from '../utils/workspace-chat';
+import { CARD_VERSION, type PaperCard } from '../utils/paper-cards';
+import { runDeepMode, toolsUnsupported } from '../utils/deep-mode';
+import { documentKey, tabDocumentIndex } from './DocumentIndexer';
 import AnnotationsPanel from './AnnotationsPanel';
 import { copyText } from '../utils/clipboard';
+import { formatMarkdown, tablesToCsv } from '../utils/markdown';
 
 const uid = () => Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
 
-async function summarizeDocumentHierarchically({
-  pageTexts,
-  maxChars,
-  provider,
-  config,
-  customInstructions,
-  signal,
-  onProgress,
-}: {
-  pageTexts: ReadonlyMap<number, string>;
-  maxChars: number;
-  provider: AIProviderInterface;
-  config: ProviderConfig;
-  customInstructions: string;
-  signal: AbortSignal;
-  onProgress: (status: string) => void;
-}): Promise<string> {
-  const chunks = chunkDocument(pageTexts, maxChars);
-  let summaries: string[] = [];
+// All chats are saved together, under a fixed key in the library store.
+const CHATS_KEY = 'c6582f8e9722f051ceb75ffcc93fd3ac0246d56ea0707980e740643d2e890305';
+const CHATS_VERSION = 1;
 
-  for (let index = 0; index < chunks.length; index++) {
-    const chunk = chunks[index];
-    onProgress(`Summarizing section ${index + 1} of ${chunks.length} (pages ${chunk.startPage}–${chunk.endPage})…`);
-    const summary = await requestProviderText(
-      provider,
-      [{
-        id: `summary-${index}`,
-        role: 'user',
-        content: 'Summarize this section faithfully. Preserve methods, findings, numerical results, limitations, recommendations, and page references. Do not add unsupported claims.',
-        timestamp: Date.now(),
-      }],
-      buildContextSystemPrompt(
-        chunk.text,
-        `pages ${chunk.startPage}–${chunk.endPage}`,
-        customInstructions
-      ),
-      config,
-      signal
-    );
-    summaries.push(`--- Summary of pages ${chunk.startPage}–${chunk.endPage} ---\n${summary}`);
+// Paper cards are cached per file hash and model.
+async function loadCard(key: string, model: string): Promise<PaperCard | null> {
+  const saved = await loadLibrary<{ cards: Record<string, PaperCard> }>('cards', key);
+  const card = saved?.cards?.[model];
+  return card?.version === CARD_VERSION ? card : null;
+}
+
+function saveCard(key: string, card: PaperCard): void {
+  void loadLibrary<{ cards: Record<string, PaperCard> }>('cards', key).then((saved) =>
+    saveLibrary('cards', key, { cards: { ...(saved?.cards || {}), [card.model]: card } })
+  );
+}
+
+// Open PDFs, most recently viewed first.
+function openDocuments(): OpenDocument[] {
+  const state = useStore.getState();
+  const tabs = new Map(state.documentTabs.map((tab) => [tab.id, tab]));
+  if (state.activeDocumentTabId && state.pdfFile) {
+    // The active tab's fields live at the top level of the state.
+    tabs.set(state.activeDocumentTabId, { ...(state as unknown as DocumentTabSession), id: state.activeDocumentTabId });
   }
-
-  let reductionPass = 1;
-  while (summaries.join('\n\n').length > Math.floor(maxChars * 0.8) && reductionPass <= 6) {
-    const groups = groupTextsWithinBudget(summaries, maxChars);
-    const reduced: string[] = [];
-    for (let index = 0; index < groups.length; index++) {
-      onProgress(`Consolidating summary ${index + 1} of ${groups.length}…`);
-      const combined = groups[index].join('\n\n');
-      const summary = await requestProviderText(
-        provider,
-        [{
-          id: `reduction-${reductionPass}-${index}`,
-          role: 'user',
-          content: 'Consolidate these section summaries without losing major findings, quantitative results, limitations, recommendations, or page references.',
-          timestamp: Date.now(),
-        }],
-        buildContextSystemPrompt(
-          combined,
-          'structured summaries covering the document',
-          customInstructions
-        ),
-        config,
-        signal
-      );
-      reduced.push(summary);
-    }
-    summaries = reduced;
-    reductionPass++;
-  }
-
-  return summaries.join('\n\n').slice(0, maxChars);
+  const order = [...state.recentTabIds, ...[...tabs.keys()].filter((id) => !state.recentTabIds.includes(id))];
+  const seen = new Set<string>();
+  return order.flatMap((tabId) => {
+    const tab = tabs.get(tabId);
+    if (!tab) return [];
+    const key = documentKey(tab, tabId);
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [{
+      tabId,
+      key,
+      name: tab.pdfFile.name,
+      ready: tab.documentTextReady,
+      tab,
+      index: () => tabDocumentIndex(tab, tabId),
+      vectors: documentVectors.get(key) || null,
+    }];
+  });
 }
 
 export default function AISidebar() {
@@ -117,29 +93,20 @@ export default function AISidebar() {
     selectedTextForAI,
     selectedPageForAI,
     selectedEndPageForAI,
-    selectedRectsForAI,
     hasPdf,
-    documentSessionId,
-    extractedPageCount,
+    documentTabs,
+    activeDocumentTabId,
+    recentTabIds,
     documentTextReady,
-    numPages,
-    digestStatus,
-    digestProgress,
-    digestError,
     sidebarTab,
     settings,
     newConversation,
-    addMessage,
-    updateLastAssistantMessage,
     setActiveConversation,
     setIsStreaming,
     deleteConversation,
     clearSelectedTextForAI,
     setSidebarTab,
     setActiveProvider,
-    rebuildDocumentDigest,
-    cancelDocumentDigest,
-    approveDocumentDigest,
   } = useStore(useShallow((state) => ({
     conversations: state.conversations,
     activeConversation: state.activeConversation,
@@ -147,29 +114,20 @@ export default function AISidebar() {
     selectedTextForAI: state.selectedTextForAI,
     selectedPageForAI: state.selectedPageForAI,
     selectedEndPageForAI: state.selectedEndPageForAI,
-    selectedRectsForAI: state.selectedRectsForAI,
     hasPdf: Boolean(state.pdfFile),
-    documentSessionId: state.documentSessionId,
-    extractedPageCount: state.extractedPageCount,
+    documentTabs: state.documentTabs,
+    activeDocumentTabId: state.activeDocumentTabId,
+    recentTabIds: state.recentTabIds,
     documentTextReady: state.documentTextReady,
-    numPages: state.numPages,
-    digestStatus: state.digestStatus,
-    digestProgress: state.digestProgress,
-    digestError: state.digestError,
     sidebarTab: state.sidebarTab,
     settings: state.settings,
     newConversation: state.newConversation,
-    addMessage: state.addMessage,
-    updateLastAssistantMessage: state.updateLastAssistantMessage,
     setActiveConversation: state.setActiveConversation,
     setIsStreaming: state.setIsStreaming,
     deleteConversation: state.deleteConversation,
     clearSelectedTextForAI: state.clearSelectedTextForAI,
     setSidebarTab: state.setSidebarTab,
     setActiveProvider: state.setActiveProvider,
-    rebuildDocumentDigest: state.rebuildDocumentDigest,
-    cancelDocumentDigest: state.cancelDocumentDigest,
-    approveDocumentDigest: state.approveDocumentDigest,
   })));
 
   const [input, setInput] = useState('');
@@ -178,207 +136,216 @@ export default function AISidebar() {
   const messagesRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const chatsLoadedRef = useRef(false);
 
   const activeConv = conversations.find((c) => c.id === activeConversation);
   const activeProviderConfig = settings.providers[settings.activeProvider];
-  const documentQuestionReady = documentTextReady;
 
-  // Follow new output only while the reader is at the bottom. An instant jump
-  // is used because starting a smooth scroll per streamed frame was costly
-  // and fought with a reader scrolling up.
+  // Open documents for the scope bar. Recomputed when tabs change.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const open = useMemo(() => openDocuments(), [documentTabs, activeDocumentTabId, recentTabIds, documentTextReady]);
+  const inScope = documentsInScope(activeConv, open, settings.chatMaxDocuments);
+  const inScopeKeys = new Set(inScope.map((document) => document.key));
+  const anyReady = inScope.some((document) => document.ready);
+
+  // Load saved chats once, then save them (debounced) whenever they change.
+  useEffect(() => {
+    void loadLibrary<{ version: number; conversations: ChatConversation[] }>('chats', CHATS_KEY).then((saved) => {
+      if (saved?.version === CHATS_VERSION && Array.isArray(saved.conversations) && useStore.getState().conversations.length === 0) {
+        // An answer that was still streaming when the app closed is incomplete.
+        useStore.getState().setConversations(saved.conversations.map((conversation) => ({
+          ...conversation,
+          messages: conversation.messages.map((message) =>
+            message.status === 'streaming' ? { ...message, status: 'aborted' as const } : message
+          ),
+        })));
+      }
+      chatsLoadedRef.current = true;
+    });
+  }, []);
+  useEffect(() => {
+    if (!chatsLoadedRef.current) return;
+    const timer = window.setTimeout(() => {
+      void saveLibrary('chats', CHATS_KEY, { version: CHATS_VERSION, conversations });
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [conversations]);
+
+  // Follow new output only while the reader is at the bottom.
   useEffect(() => {
     const messages = messagesRef.current;
     if (messages && stickToBottomRef.current) messages.scrollTop = messages.scrollHeight;
   }, [activeConv?.messages]);
 
-  // When text is selected for AI, focus the input (but don't populate it)
   useEffect(() => {
-    if (selectedTextForAI) {
-      inputRef.current?.focus();
-    }
+    if (selectedTextForAI) inputRef.current?.focus();
   }, [selectedTextForAI]);
 
-  useEffect(() => {
-    setContextStatus(null);
-    setInput('');
-  }, [documentSessionId]);
+  const setScope = (conversationId: string | null, scope: ChatConversation['scope']) => {
+    const id = conversationId || newConversation();
+    useStore.getState().updateConversation(id, { scope });
+  };
 
-  const sendMessage = useCallback(async () => {
-    const text = input.trim();
-    if ((!text && !selectedTextForAI) || isStreaming) return;
-    if (!selectedTextForAI && !documentTextReady) return;
-    const requestTabId = useStore.getState().activeDocumentTabId;
-    if (!requestTabId) return;
-    const requestTabIsActive = () => useStore.getState().activeDocumentTabId === requestTabId;
-
-    const selectionText = selectedTextForAI;
-    const selectionPage = selectedPageForAI;
-    const selectionEndPage = selectedEndPageForAI || selectionPage;
-    const selectionRects = [...selectedRectsForAI];
-
-    let convId = activeConversation;
-    if (!convId) {
-      convId = newConversation();
+  const toggleDocument = (key: string) => {
+    const keys = new Set(inScope.map((document) => document.key));
+    if (keys.has(key)) {
+      if (keys.size === 1) return;
+      keys.delete(key);
+    } else {
+      keys.add(key);
     }
+    setScope(activeConversation, { mode: 'custom', keys: [...keys] });
+  };
 
-    const fullContent = selectionText
+  // analyze: ask each document separately, then combine (the Analyze button).
+  const sendMessage = useCallback(async (analyze = false) => {
+    const text = input.trim();
+    const state = useStore.getState();
+    if ((!text && !state.selectedTextForAI && !analyze) || state.isStreaming) return;
+
+    const convId = state.activeConversation || newConversation();
+    let conversation = useStore.getState().conversations.find((c) => c.id === convId)!;
+    const documents = openDocuments();
+    const activeKey = state.activeDocumentTabId && state.pdfFile ? documentKey(state as never, state.activeDocumentTabId) : undefined;
+    const selectionText = state.selectedTextForAI;
+    const scoped = documentsInScope(conversation, documents, state.settings.chatMaxDocuments, selectionText ? activeKey : undefined);
+    if (!selectionText && !scoped.some((document) => document.ready)) return;
+
+    const labels = assignLabels(conversation.documents || [], scoped);
+    useStore.getState().updateConversation(convId, { documents: labels });
+    const label = (key: string | undefined) => labels.find((item) => item.key === key)?.label || '';
+
+    const question = selectionText && !analyze
       ? text || 'Please explain the selected passage.'
-      : text;
+      : text || (analyze ? 'Compare these documents: research question, method, data, main findings and limitations.' : text);
+    const selection = selectionText && !analyze
+      ? {
+          text: selectionText,
+          key: activeKey || '',
+          label: label(activeKey),
+          page: state.selectedPageForAI,
+          endPage: state.selectedEndPageForAI || state.selectedPageForAI,
+        }
+      : null;
 
-    const userMsg: ChatMessage & { rects?: typeof selectedRectsForAI } = {
+    const store = useStore.getState();
+    store.addMessage(convId, {
       id: uid(),
       role: 'user',
-      content: fullContent,
+      content: question,
       timestamp: Date.now(),
       selectedText: selectionText || undefined,
-      pageNumber: selectionText ? selectionPage : undefined,
-      pageEndNumber: selectionText ? selectionEndPage : undefined,
-    };
-    if (selectionRects.length > 0) {
-      (userMsg as any).rects = selectionRects;
-    }
-    addMessage(convId, userMsg, requestTabId);
+      pageNumber: selection ? selection.page : undefined,
+      pageEndNumber: selection ? selection.endPage : undefined,
+      documentKey: selection ? activeKey : undefined,
+      documentName: selection ? state.pdfFile?.name : undefined,
+    });
     stickToBottomRef.current = true;
     setInput('');
-    clearSelectedTextForAI();
+    store.clearSelectedTextForAI();
 
-    const assistantMsg: ChatMessage = {
+    const config = state.settings.providers[state.settings.activeProvider];
+    store.addMessage(convId, {
       id: uid(),
       role: 'assistant',
       content: '',
       timestamp: Date.now(),
-      providerId: settings.activeProvider,
-      model: activeProviderConfig.model,
-    };
-    addMessage(convId, assistantMsg, requestTabId);
-    setIsStreaming(true, requestTabId);
+      providerId: state.settings.activeProvider,
+      model: config.model,
+      status: 'streaming',
+    });
+    store.setIsStreaming(true);
 
     const abort = new AbortController();
-    registerChatRequest(requestTabId, abort);
+    registerChatRequest(WORKSPACE_CHAT, abort);
     let streamFrame = 0;
-
+    let pendingDeepText = '';
     try {
-      const state = useStore.getState();
-      const conv = state.conversations.find((c) => c.id === convId);
-      const allMessages = conv?.messages.filter((m) => m.role !== 'system') || [];
-      const apiMessages = allMessages.slice(0, -1).filter((m) => m.content);
-      const provider = providers[settings.activeProvider];
+      const provider = providers[state.settings.activeProvider];
+      if (!config.enabled) throw new Error(`${config.name} is disabled. Enable it in Settings before sending a message.`);
+      if (!provider) throw new Error('Provider not found. Check your settings.');
 
-      if (!activeProviderConfig.enabled) {
-        throw new Error(`${activeProviderConfig.name} is disabled. Enable it in Settings before sending a message.`);
-      }
-
-      if (!selectionText && state.pageTexts.size === 0) {
-        throw new Error('No extractable PDF text is available yet. Wait for loading to finish or select a passage.');
-      }
-
-      if (!provider) {
-        updateLastAssistantMessage(convId, '⚠️ Provider not found. Check your settings.', requestTabId);
-        setIsStreaming(false, requestTabId);
-        return;
-      }
-
-      const maxContextChars = Math.max(
-        10000,
-        Math.min(2000000, Math.round(settings.maxContextChars))
-      );
-
-      let contextText = '';
-      let contextDescription = '';
-      if (selectionText) {
-        const context = buildDocumentContext({
-          pageTexts: state.pageTexts,
-          mode: 'selection',
-          query: text || fullContent,
-          maxChars: maxContextChars,
-          selectedPage: selectionPage,
-          selectedEndPage: selectionEndPage,
-          selectedText: selectionText,
-        });
-        contextText = context.text;
-        contextDescription = context.description;
-      } else if (settings.contextMode === 'rawEntire') {
-        const context = buildDocumentContext({
-          pageTexts: state.pageTexts,
-          mode: 'entire',
-          query: text,
-          maxChars: maxContextChars,
-        });
-        contextText = context.text;
-        contextDescription = context.description;
-        if (context.requiresHierarchicalSummary) {
-          contextDescription = `fresh hierarchical summaries of the entire ${state.pageTexts.size}-page document`;
-          contextText = await summarizeDocumentHierarchically({
-            pageTexts: state.pageTexts,
-            maxChars: maxContextChars,
-            provider,
-            config: activeProviderConfig,
-            customInstructions: settings.customInstructions,
+      conversation = useStore.getState().conversations.find((c) => c.id === convId)!;
+      // prepareRequest reads the conversation up to and including the new
+      // question, so drop the empty answer placeholder.
+      const common = {
+        conversation: { ...conversation, messages: conversation.messages.slice(0, -1) },
+        documents: scoped,
+        labels,
+        settings: state.settings,
+        config,
+        provider,
+        signal: abort.signal,
+        loadCard,
+        onProgress: (status: string) => {
+          setContextStatus(status);
+          useStore.getState().updateLastAssistantMessage(convId, status);
+        },
+      };
+      // Deep mode: the model searches and reads with tools. A selection or
+      // an analysis uses the normal path. If the model rejects tools, answer
+      // normally and say so.
+      let deepNote = '';
+      if (state.settings.deepMode && !analyze && !selection) {
+        try {
+          const deep = await runDeepMode({
+            documents: scoped.filter((document) => document.ready).map((document) => ({
+              label: label(document.key),
+              key: document.key,
+              index: document.index(),
+              vectors: document.vectors?.vectors,
+              windowPassages: document.vectors?.passageOf,
+              highlights: document.tab.highlights,
+            })),
+            conversation: common.conversation,
+            labelOf: (key) => label(key) || undefined,
+            settings: state.settings,
+            config,
             signal: abort.signal,
-            onProgress: (status) => {
-              if (requestTabIsActive()) setContextStatus(status);
-              updateLastAssistantMessage(convId!, status, requestTabId);
+            queryVector: embedQuery,
+            loadCard: (key) => loadCard(key, config.model),
+            onText: (partial) => {
+              pendingDeepText = partial;
+              if (!streamFrame) streamFrame = window.requestAnimationFrame(() => {
+                streamFrame = 0;
+                useStore.getState().updateLastAssistantMessage(convId, pendingDeepText);
+              });
+            },
+            onActivity: (log) => {
+              setContextStatus(log[log.length - 1] + '…');
+              useStore.getState().patchLastAssistantMessage(convId, { toolLog: log });
             },
           });
-        }
-      } else {
-        const completeContext = buildDocumentContext({
-          pageTexts: state.pageTexts,
-          mode: 'entire',
-          query: text,
-          maxChars: maxContextChars,
-        });
-        const strategy = chooseDocumentAwareStrategy(
-          text,
-          completeContext.requiresHierarchicalSummary,
-          Boolean(state.documentDigest)
-        );
-        if (strategy === 'entire-original') {
-          contextText = completeContext.text;
-          contextDescription = `the complete original text of the ${completeContext.pages.length}-page document`;
-        } else if (strategy === 'hierarchical-summary') {
-          contextDescription = `complete hierarchical summaries of the entire ${state.pageTexts.size}-page document`;
-          contextText = await summarizeDocumentHierarchically({
-            pageTexts: state.pageTexts,
-            maxChars: maxContextChars,
-            provider,
-            config: activeProviderConfig,
-            customInstructions: settings.customInstructions,
-            signal: abort.signal,
-            onProgress: (status) => {
-              if (requestTabIsActive()) setContextStatus(status);
-              updateLastAssistantMessage(convId!, status, requestTabId);
-            },
+          window.cancelAnimationFrame(streamFrame);
+          streamFrame = 0;
+          useStore.getState().patchLastAssistantMessage(convId, {
+            content: deep.text,
+            sources: deep.sources,
+            notes: deep.notes,
+            toolLog: deep.log,
+            contextDescription: `deep mode (${deep.log.length} tool calls)`,
+            status: 'done',
           });
-        } else if (strategy === 'indexed-retrieval' && state.documentDigest) {
-          const digest = state.documentDigest;
-          const retrieval = retrieveDigestContext({
-            digest,
-            pageTexts: state.pageTexts,
-            query: text,
-            maxChars: maxContextChars,
-            maxRanges: settings.maxRetrievedRanges,
-          });
-          contextText = retrieval.text;
-          contextDescription = retrieval.description;
-        } else {
-          const fallback = buildDocumentContext({
-            pageTexts: state.pageTexts,
-            mode: 'relevant',
-            query: text,
-            maxChars: maxContextChars,
-          });
-          contextText = fallback.text;
-          contextDescription = `${fallback.description} selected directly from the original PDF while the page index is unavailable`;
+          return;
+        } catch (error) {
+          if (!toolsUnsupported(error)) throw error;
+          window.cancelAnimationFrame(streamFrame);
+          streamFrame = 0;
+          deepNote = ' · deep mode is not supported by this model, answered normally';
+          useStore.getState().patchLastAssistantMessage(convId, { content: '', toolLog: undefined });
         }
       }
-
-      if (requestTabIsActive()) setContextStatus(`Using ${contextDescription}`);
-      const systemPrompt = buildContextSystemPrompt(
-        contextText,
-        contextDescription,
-        settings.customInstructions
-      );
+      const request = analyze
+        ? await prepareAnalysis({ ...common, question, saveCard })
+        : await prepareRequest({ ...common, question, selection, queryVector: embedQuery });
+      request.description += deepNote;
+      setContextStatus(`Using ${request.description}${request.notes.length ? ` and ${request.notes.length} of your markings` : ''}`);
+      useStore.getState().patchLastAssistantMessage(convId, {
+        content: '',
+        sources: request.sources,
+        notes: request.notes,
+        contextDescription: request.description,
+      });
 
       // Tokens can arrive hundreds of times per second. Keep only the latest
       // text and write it to the store at most once per animation frame.
@@ -386,66 +353,68 @@ export default function AISidebar() {
       const flushPending = () => {
         streamFrame = 0;
         if (pendingText === null) return;
-        updateLastAssistantMessage(convId!, pendingText, requestTabId);
+        useStore.getState().updateLastAssistantMessage(convId, pendingText);
         pendingText = null;
       };
-      await requestProviderText(
-        provider,
-        apiMessages,
-        systemPrompt,
-        activeProviderConfig,
-        abort.signal,
-        (accumulated) => {
-          pendingText = accumulated;
-          if (!streamFrame) streamFrame = window.requestAnimationFrame(flushPending);
-        }
-      );
+      await requestProviderText(provider, request.history, request.systemPrompt, config, abort.signal, (accumulated) => {
+        pendingText = accumulated;
+        if (!streamFrame) streamFrame = window.requestAnimationFrame(flushPending);
+      });
       window.cancelAnimationFrame(streamFrame);
       flushPending();
+      useStore.getState().patchLastAssistantMessage(convId, { status: 'done' });
     } catch (err: any) {
-      // A queued frame must not overwrite the error message below.
       window.cancelAnimationFrame(streamFrame);
-      if (err.name !== 'AbortError') {
-        updateLastAssistantMessage(convId, `⚠️ Error: ${err.message}`, requestTabId);
+      if (err?.name === 'AbortError') {
+        useStore.getState().patchLastAssistantMessage(convId, { status: 'aborted' });
+      } else {
+        useStore.getState().patchLastAssistantMessage(convId, { content: `⚠️ Error: ${err?.message || err}`, status: 'error' });
       }
     } finally {
-      setIsStreaming(false, requestTabId);
-      if (requestTabIsActive()) setContextStatus(null);
-      clearChatRequest(requestTabId, abort);
+      useStore.getState().setIsStreaming(false);
+      setContextStatus(null);
+      clearChatRequest(WORKSPACE_CHAT, abort);
     }
-  }, [
-    input,
-    isStreaming,
-    activeConversation,
-    documentTextReady,
-    settings.activeProvider,
-    settings.contextMode,
-    settings.maxContextChars,
-    settings.maxRetrievedRanges,
-    settings.customInstructions,
-    activeProviderConfig,
-    selectedTextForAI,
-    selectedPageForAI,
-    selectedEndPageForAI,
-    selectedRectsForAI,
-    newConversation,
-    addMessage,
-    updateLastAssistantMessage,
-    setIsStreaming,
-    clearSelectedTextForAI,
-  ]);
+  }, [input, newConversation]);
 
   const stopStreaming = () => {
-    const tabId = useStore.getState().activeDocumentTabId;
-    if (tabId) abortChatRequest(tabId);
-    setIsStreaming(false, tabId);
+    abortChatRequest(WORKSPACE_CHAT);
+    setIsStreaming(false);
+  };
+
+  // A click on a citation chip opens the cited PDF at the cited page.
+  const openCitation = (event: React.MouseEvent) => {
+    const chip = (event.target as HTMLElement).closest<HTMLElement>('.lexio-cite');
+    if (!chip || !activeConv) return;
+    const messageId = chip.closest<HTMLElement>('[data-message-id]')?.dataset.messageId;
+    const message = activeConv.messages.find((item) => item.id === messageId);
+    const document = activeConv.documents?.find((item) => item.label === chip.dataset.label);
+    if (!document) return;
+    let page = Number(chip.dataset.page) || 0;
+    if (chip.dataset.note) {
+      page = message?.notes?.find((note) => note.ref === chip.dataset.note && note.label === document.label)?.page || page;
+    }
+    const target = openDocuments().find((item) => item.key === document.key);
+    if (!target) {
+      setContextStatus(`${document.name} is not open. Open it again to jump to the cited page.`);
+      window.setTimeout(() => setContextStatus(null), 4000);
+      return;
+    }
+    if (page > 0) useStore.getState().jumpToPage(target.tabId, page);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      sendMessage(false);
     }
+  };
+
+  const canSend = Boolean((input.trim() || selectedTextForAI) && (selectedTextForAI || anyReady));
+  const labelFor = (key: string) => activeConv?.documents?.find((item) => item.key === key)?.label;
+  const updateSettings = (patch: Partial<typeof settings>) => {
+    useStore.getState().updateSettings(patch);
+    window.electronAPI?.saveSettings(useStore.getState().settings);
   };
 
   return (
@@ -468,9 +437,8 @@ export default function AISidebar() {
 
       {sidebarTab === 'chat' ? (
         <>
-          {/* Provider selector + conversation list */}
+          {/* Provider selector + new chat */}
           <div className="flex items-center gap-2 px-3 py-2 border-b border-surface-3 flex-shrink-0">
-            {/* Provider dropdown */}
             <div className="relative flex items-center">
               <button
                 onClick={() => setShowProviderMenu(!showProviderMenu)}
@@ -521,47 +489,44 @@ export default function AISidebar() {
             </button>
           </div>
 
-          {/* Conversation tabs */}
+          {/* Conversation tabs, newest first */}
           {conversations.length > 0 && (
             <div className="flex gap-1 px-3 py-1.5 border-b border-surface-3 overflow-x-auto flex-shrink-0">
-              {conversations.map((conv) => {
+              {[...conversations].reverse().map((conv) => {
                 const isActive = conv.id === activeConversation;
                 return (
-                <div
-                  key={conv.id}
-                  className={`group flex items-center rounded text-xs whitespace-nowrap transition-colors ${
-                    isActive
-                      ? 'bg-accent/20 text-accent-light'
-                      : 'text-text-muted hover:bg-surface-3 hover:text-text-secondary'
-                  }`}
-                >
-                  <button
-                    onClick={() => setActiveConversation(conv.id)}
-                    className="flex min-w-0 items-center gap-1 py-1 pl-2"
-                    title={conv.title}
-                  >
-                    <MessageSquare size={11} className="flex-shrink-0" />
-                    <span className="max-w-[120px] truncate">{conv.title}</span>
-                  </button>
-                  <button
-                    aria-label={`Close chat: ${conv.title}`}
-                    title="Close chat"
-                    onClick={() => {
-                      if (isActive && isStreaming) {
-                        const tabId = useStore.getState().activeDocumentTabId;
-                        if (tabId) abortChatRequest(tabId);
-                        setIsStreaming(false, tabId);
-                      }
-                      deleteConversation(conv.id);
-                    }}
-                    className={`mx-1 rounded p-0.5 hover:bg-red-500/10 hover:text-red-400 focus:opacity-100 ${
-                      isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                  <div
+                    key={conv.id}
+                    className={`group flex items-center rounded text-xs whitespace-nowrap transition-colors ${
+                      isActive
+                        ? 'bg-accent/20 text-accent-light'
+                        : 'text-text-muted hover:bg-surface-3 hover:text-text-secondary'
                     }`}
                   >
-                    <X size={10} />
-                  </button>
-                </div>
-              );})}
+                    <button
+                      onClick={() => setActiveConversation(conv.id)}
+                      className="flex min-w-0 items-center gap-1 py-1 pl-2"
+                      title={conv.title}
+                    >
+                      <MessageSquare size={11} className="flex-shrink-0" />
+                      <span className="max-w-[120px] truncate">{conv.title}</span>
+                    </button>
+                    <button
+                      aria-label={`Delete chat: ${conv.title}`}
+                      title="Delete chat"
+                      onClick={() => {
+                        if (isActive && isStreaming) stopStreaming();
+                        deleteConversation(conv.id);
+                      }}
+                      className={`mx-1 rounded p-0.5 hover:bg-red-500/10 hover:text-red-400 focus:opacity-100 ${
+                        isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+                      }`}
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -578,47 +543,92 @@ export default function AISidebar() {
               const element = event.currentTarget;
               stickToBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
             }}
+            onClick={openCitation}
             className="flex-1 overflow-y-auto px-3 py-3 space-y-3"
           >
             {!activeConv || activeConv.messages.length === 0 ? (
               <EmptyChat />
             ) : (
-              activeConv.messages.map((msg) => <ChatBubble key={msg.id} message={msg} />)
+              activeConv.messages.map((msg) => (
+                <ChatBubble key={msg.id} message={msg} documents={activeConv.documents || EMPTY_DOCUMENTS} />
+              ))
             )}
           </div>
 
           {/* Input */}
           <div className="flex-shrink-0 p-3 border-t border-surface-3">
-            {hasPdf && settings.contextMode === 'rawEntire' && !documentTextReady && !selectedTextForAI && (
-              <div className="mb-2 rounded-lg border border-accent/20 bg-accent/5 px-2.5 py-2 text-[11px] text-accent-light">
-                Extracting PDF text… {extractedPageCount} / {numPages || '…'} pages.
+            {/* Documents this chat searches */}
+            {hasPdf && (
+              <div className="mb-2 flex flex-wrap items-center gap-1">
+                {open.map((document) => {
+                  const selected = inScopeKeys.has(document.key);
+                  const label = labelFor(document.key);
+                  return (
+                    <button
+                      key={document.key}
+                      onClick={() => toggleDocument(document.key)}
+                      title={`${document.name}${document.ready ? '' : ' (text not ready yet)'}${selected ? ' · included' : ' · not included'}`}
+                      className={`flex max-w-[170px] items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] transition-colors ${
+                        selected
+                          ? 'border-accent/40 bg-accent/10 text-accent-light'
+                          : 'border-surface-3 text-text-muted hover:text-text-secondary'
+                      }`}
+                    >
+                      {label && <span className="font-semibold">{label}</span>}
+                      <span className="truncate">{document.name.replace(/\.pdf$/i, '')}</span>
+                      {!document.ready && <span className="h-1.5 w-1.5 flex-shrink-0 animate-pulse rounded-full bg-amber-300" />}
+                    </button>
+                  );
+                })}
+                <span className="flex-1" />
+                {open.length > 1 && (
+                  <>
+                    <button
+                      onClick={() => setScope(activeConversation, { mode: 'all', keys: [] })}
+                      className={`rounded px-1.5 py-0.5 text-[10px] ${activeConv?.scope?.mode !== 'custom' ? 'text-accent-light' : 'text-text-muted hover:text-text-secondary'}`}
+                      title={`Search the ${Math.min(open.length, settings.chatMaxDocuments)} most recently viewed PDFs`}
+                    >
+                      All open
+                    </button>
+                    <button
+                      onClick={() => {
+                        const current = open.find((document) => document.tabId === activeDocumentTabId);
+                        if (current) setScope(activeConversation, { mode: 'custom', keys: [current.key] });
+                      }}
+                      className="rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:text-text-secondary"
+                      title="Search only the PDF shown now"
+                    >
+                      This PDF
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => updateSettings({ includeNotes: !settings.includeNotes })}
+                  className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${settings.includeNotes ? 'text-accent-light' : 'text-text-muted hover:text-text-secondary'}`}
+                  title={settings.includeNotes ? 'Your highlights and notes are sent with questions' : 'Your highlights and notes are not sent'}
+                >
+                  <StickyNote size={10} /> Notes {settings.includeNotes ? 'on' : 'off'}
+                </button>
+                <button
+                  onClick={() => updateSettings({ deepMode: !settings.deepMode })}
+                  className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] ${settings.deepMode ? 'text-accent-light' : 'text-text-muted hover:text-text-secondary'}`}
+                  title={settings.deepMode
+                    ? 'Deep mode on: the AI searches and reads the PDFs itself with tools over several steps. Slower, and needs a model that supports tools.'
+                    : 'Deep mode off. Turn on to let the AI search and read the PDFs itself for complex questions.'}
+                >
+                  <Telescope size={10} /> Deep {settings.deepMode ? 'on' : 'off'}
+                </button>
+                <button
+                  onClick={() => sendMessage(true)}
+                  disabled={isStreaming || !anyReady}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:text-accent-light disabled:opacity-40"
+                  title={`Analyze across documents: asks each of the ${inScope.filter((document) => document.ready).length} selected PDFs your question separately, then combines the answers (${inScope.filter((document) => document.ready).length + 1} requests). With an empty question it compares them.`}
+                >
+                  <Layers size={10} /> Analyze
+                </button>
               </div>
             )}
-            {hasPdf && settings.contextMode === 'documentAware' && !selectedTextForAI && digestStatus !== 'ready' && (
-              <div className={`mb-2 rounded-lg border px-2.5 py-2 text-[11px] ${
-                digestStatus === 'error'
-                  ? 'border-red-500/30 bg-red-500/5 text-red-300'
-                  : 'border-accent/20 bg-accent/5 text-accent-light'
-              }`}>
-                <div>{digestError || digestProgress || 'Preparing reusable document digest…'}</div>
-                {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
-                  <button onClick={cancelDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Cancel digest generation
-                  </button>
-                )}
-                {digestStatus === 'needs-approval' && (
-                  <button onClick={approveDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Build page index
-                  </button>
-                )}
-                {(digestStatus === 'error' || digestStatus === 'cancelled') && (
-                  <button onClick={rebuildDocumentDigest} className="mt-1 underline hover:text-text-primary">
-                    Build digest again
-                  </button>
-                )}
-              </div>
-            )}
-            {/* Selected text context card */}
+
             {selectedTextForAI && (
               <div className="mb-2 p-2 bg-accent/10 border border-accent/20 rounded-lg">
                 <div className="flex items-center justify-between mb-1">
@@ -647,20 +657,19 @@ export default function AISidebar() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={selectedTextForAI ? "Ask about this passage…" : "Ask about the document…"}
+                placeholder={selectedTextForAI
+                  ? 'Ask about this passage…'
+                  : inScope.length > 1 ? `Ask about ${inScope.length} PDFs… (name one with @D2)` : 'Ask about the document…'}
                 rows={Math.min(6, Math.max(1, input.split('\n').length))}
                 className="block w-full bg-surface-2 text-text-primary text-sm leading-5 rounded-xl px-4 py-3 pr-12 resize-none outline-none border border-surface-3 focus:border-accent/40 transition-colors placeholder-text-muted"
               />
               <button
-                onClick={isStreaming ? stopStreaming : sendMessage}
-                disabled={
-                  (!input.trim() && !selectedTextForAI && !isStreaming) ||
-                  (!selectedTextForAI && !documentQuestionReady && !isStreaming)
-                }
+                onClick={isStreaming ? stopStreaming : () => sendMessage(false)}
+                disabled={!isStreaming && !canSend}
                 className={`absolute inset-y-0 right-2 my-auto flex h-8 w-8 items-center justify-center rounded-lg p-0 transition-colors ${
                   isStreaming
                     ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                    : (input.trim() || selectedTextForAI) && (selectedTextForAI || documentQuestionReady)
+                    : canSend
                       ? 'bg-accent/20 text-accent-light hover:bg-accent/30'
                       : 'text-text-muted cursor-not-allowed'
                 }`}
@@ -668,7 +677,6 @@ export default function AISidebar() {
                 {isStreaming ? <Square size={16} /> : <Send size={16} />}
               </button>
             </div>
-
           </div>
         </>
       ) : (
@@ -677,6 +685,8 @@ export default function AISidebar() {
     </div>
   );
 }
+
+const EMPTY_DOCUMENTS: ConversationDocument[] = [];
 
 // ─── Sub-components ───
 
@@ -708,10 +718,22 @@ function TabButton({
 
 // Memoized: while one answer streams, the other bubbles keep the same message
 // object and skip re-rendering and re-formatting entirely.
-const ChatBubble = memo(function ChatBubble({ message }: { message: ChatMessage }) {
+const ChatBubble = memo(function ChatBubble({
+  message,
+  documents,
+}: {
+  message: ChatMessage;
+  documents: readonly ConversationDocument[];
+}) {
   const isUser = message.role === 'user';
   const [copied, setCopied] = useState(false);
-  const html = useMemo(() => formatMarkdown(message.content), [message.content]);
+  const html = useMemo(
+    () => renderCitations(formatMarkdown(message.content), message, documents),
+    [message, documents]
+  );
+  const selectionLabel = documents.find((document) => document.key === message.documentKey)?.label;
+  const csv = useMemo(() => (isUser || message.status === 'streaming' ? null : tablesToCsv(message.content)), [isUser, message.content, message.status]);
+  const [csvCopied, setCsvCopied] = useState(false);
 
   const copyMessage = async () => {
     try {
@@ -724,7 +746,7 @@ const ChatBubble = memo(function ChatBubble({ message }: { message: ChatMessage 
   };
 
   return (
-    <div className={`chat-message flex items-end gap-1 ${isUser ? 'justify-end' : 'justify-start'}`}>
+    <div data-message-id={message.id} className={`chat-message flex items-end gap-1 ${isUser ? 'justify-end' : 'justify-start'}`}>
       {isUser && message.content && (
         <MessageCopyButton copied={copied} isUser onClick={copyMessage} />
       )}
@@ -738,9 +760,10 @@ const ChatBubble = memo(function ChatBubble({ message }: { message: ChatMessage 
         {isUser && message.selectedText && (
           <div className="mb-2 rounded-lg border border-accent/20 bg-surface-1/50 px-2.5 py-2 text-xs text-text-secondary">
             <div className="mb-1 text-[10px] uppercase tracking-wider text-accent-light">
+              {`Selected passage${selectionLabel ? ` · ${selectionLabel}` : ''}`}
               {message.pageEndNumber && message.pageNumber && message.pageEndNumber !== message.pageNumber
-                ? `Selected passage · pages ${message.pageNumber}–${message.pageEndNumber}`
-                : `Selected passage${message.pageNumber ? ` · page ${message.pageNumber}` : ''}`}
+                ? ` · pages ${message.pageNumber}–${message.pageEndNumber}`
+                : message.pageNumber ? ` · page ${message.pageNumber}` : ''}
             </div>
             <div className="line-clamp-3 whitespace-pre-wrap">“{message.selectedText}”</div>
           </div>
@@ -760,6 +783,30 @@ const ChatBubble = memo(function ChatBubble({ message }: { message: ChatMessage 
         {!isUser && message.model && (
           <div className="mt-2 border-t border-surface-3/70 pt-1.5 text-[10px] text-text-muted">
             {message.providerId ? `${message.providerId} · ` : ''}{message.model}
+            {message.status === 'aborted' ? ' · stopped' : ''}
+            {message.toolLog?.length ? (
+              <details className="mt-1">
+                <summary className="cursor-pointer">What the AI looked at ({message.toolLog.length})</summary>
+                <ul className="mt-1 list-disc pl-4">
+                  {message.toolLog.map((entry, index) => <li key={index}>{entry}</li>)}
+                </ul>
+              </details>
+            ) : null}
+            {message.contextDescription ? ` · used ${message.contextDescription}` : ''}
+            {csv && (
+              <button
+                type="button"
+                onClick={async () => {
+                  await copyText(csv);
+                  setCsvCopied(true);
+                  window.setTimeout(() => setCsvCopied(false), 1500);
+                }}
+                className="ml-2 rounded px-1 text-accent-light hover:bg-surface-3"
+                title="Copy the table as CSV for a spreadsheet"
+              >
+                {csvCopied ? 'Copied' : 'Copy table as CSV'}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -798,28 +845,11 @@ function EmptyChat() {
       <div className="w-12 h-12 rounded-2xl bg-accent/10 flex items-center justify-center mb-4">
         <Sparkles size={22} className="text-accent-light" />
       </div>
-      <p className="text-sm text-text-secondary font-medium mb-1">Ask about your document</p>
+      <p className="text-sm text-text-secondary font-medium mb-1">Ask about your documents</p>
       <p className="text-xs text-text-muted leading-relaxed">
-        Select text and click "Ask AI", or type a question below. Document-aware mode reuses the
-        cached digest to find and send original source page ranges.
+        Select text and click "Ask AI", or type a question below. The chat searches the open PDFs
+        marked below, uses your highlights and notes, and cites the pages it used.
       </p>
     </div>
   );
-}
-
-// ─── Simple markdown formatting ───
-
-function formatMarkdown(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-    .replace(/`([^`]+)`/g, '<code class="bg-surface-3 px-1 py-0.5 rounded text-accent-light text-[0.85em]">$1</code>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/^### (.+)$/gm, '<strong class="text-base">$1</strong>')
-    .replace(/^## (.+)$/gm, '<strong class="text-lg">$1</strong>')
-    .replace(/^# (.+)$/gm, '<strong class="text-xl">$1</strong>')
-    .replace(/^- (.+)$/gm, '• $1');
 }

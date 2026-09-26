@@ -2,6 +2,8 @@
 
 type Unsubscribe = () => void;
 
+export type LibraryKind = 'text' | 'notes' | 'chats' | 'cards' | 'embeddings' | 'ocr';
+
 interface ElectronAPI {
   openPdf: () => Promise<void>;
   openDroppedPdf: (file: File) => Promise<PdfFileData | null>;
@@ -11,9 +13,14 @@ interface ElectronAPI {
   loadSettings: () => Promise<unknown>;
   saveSettings: (settings: AppSettings) => Promise<void>;
   credentialStatus: () => Promise<{ persistent: boolean; weak: boolean }>;
-  loadDigest: (fingerprint: string) => Promise<unknown>;
-  saveDigest: (fingerprint: string, digest: DocumentDigest) => Promise<void>;
-  deleteDigest: (fingerprint: string) => Promise<void>;
+  loadLibrary: (kind: LibraryKind, key: string) => Promise<unknown>;
+  saveLibrary: (kind: LibraryKind, key: string, data: unknown) => Promise<void>;
+  deleteLibrary: (kind: LibraryKind, key: string) => Promise<void>;
+  userName: () => Promise<string>;
+  embeddingStatus: () => Promise<{ installed: boolean; downloading: boolean }>;
+  downloadEmbeddingModel: () => Promise<void>;
+  loadEmbeddingModel: () => Promise<{ model: Uint8Array; tokenizer: string } | null>;
+  onEmbeddingProgress: (cb: (progress: { file: string; received: number; total: number }) => void) => Unsubscribe;
   onPdfOpened: (cb: (data: PdfFileData) => void) => Unsubscribe;
   onToggleSidebar: (cb: () => void) => Unsubscribe;
   onZoomIn: (cb: () => void) => Unsubscribe;
@@ -52,7 +59,9 @@ export interface PdfFileData {
 
 export type HighlightColor = 'yellow' | 'green' | 'blue' | 'pink' | 'orange';
 
-export type AnnotationType = 'highlight' | 'underline' | 'strikeout';
+// 'note' is a sticky note, text box or drawing read from the PDF file. It
+// has no marked text; pdf.js draws it.
+export type AnnotationType = 'highlight' | 'underline' | 'strikeout' | 'note';
 
 // Rect stored as percentages (0-1) relative to page dimensions for zoom independence
 export interface RelativeRect {
@@ -71,6 +80,19 @@ export interface Highlight {
   type: AnnotationType;
   comment?: string;
   createdAt: number;
+  // Who wrote the comment. Missing means the user of this computer.
+  author?: string;
+  // Set for annotations read from the PDF file. pdfRef is the object id of
+  // the original ("722R"), so saving can update or remove exactly that one.
+  source?: 'lexio' | 'file';
+  pdfRef?: string;
+  pdfSubtype?: string;
+  // Original color (0-1 RGB). Saving keeps it unless the color was changed.
+  pdfColor?: [number, number, number];
+  replies?: Array<{ author: string; text: string; date?: number }>;
+  modifiedAt?: number;
+  // Drawings and shapes from other apps: listed, not editable.
+  readOnly?: boolean;
 }
 
 export interface Annotation {
@@ -96,6 +118,25 @@ export interface ProviderConfig {
   baseUrl?: string;
   model: string;
   models: string[];
+  // Context window in tokens. 0 or missing means automatic (known model size,
+  // or a provider default). For Ollama it is also sent as num_ctx.
+  contextTokens?: number;
+}
+
+// A page that was sent to the model, for checking citations.
+export interface ContextSource {
+  label: string;
+  key: string;
+  page: number;
+}
+
+// A marking (highlight, note) that was sent to the model as N1, N2, ...
+export interface NoteReference {
+  ref: string;
+  label: string;
+  key: string;
+  page: number;
+  highlightId: string;
 }
 
 export interface ChatMessage {
@@ -106,8 +147,26 @@ export interface ChatMessage {
   selectedText?: string;
   pageNumber?: number;
   pageEndNumber?: number;
+  // Document of the selected passage (file hash or tab id) and its name.
+  documentKey?: string;
+  documentName?: string;
   providerId?: AIProvider;
   model?: string;
+  // Assistant messages: whether the answer finished, and what was sent.
+  status?: 'streaming' | 'done' | 'error' | 'aborted';
+  sources?: ContextSource[];
+  notes?: NoteReference[];
+  contextDescription?: string;
+  // Deep mode: what the model searched and read, in order.
+  toolLog?: string[];
+}
+
+// A document a conversation has used, with the label it keeps in that
+// conversation (D1, D2, ...), even after its tab is closed.
+export interface ConversationDocument {
+  key: string;
+  name: string;
+  label: string;
 }
 
 export interface ChatConversation {
@@ -115,6 +174,11 @@ export interface ChatConversation {
   title: string;
   messages: ChatMessage[];
   createdAt: number;
+  updatedAt?: number;
+  documents?: ConversationDocument[];
+  // 'all': the most recently viewed open PDFs (up to the Settings limit).
+  // 'custom': only the listed document keys that are open.
+  scope?: { mode: 'all' | 'custom'; keys: string[] };
 }
 
 export interface PageRange {
@@ -122,53 +186,29 @@ export interface PageRange {
   endPage: number;
 }
 
-export interface DigestSection extends PageRange {
-  id: string;
-  title: string;
-  summary: string;
-  keywords: string[];
-  entities: string[];
-  sectionType: 'chapter' | 'appendix' | 'references' | 'body' | 'other';
+// Text recognized on a scanned page. Word boxes are relative to the page
+// (0-1, top-left origin) so they work at any zoom.
+export interface OcrWord {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  // Last word of a line.
+  lineEnd?: boolean;
 }
 
-export interface DigestTopic {
-  name: string;
-  description: string;
-  pageRanges: PageRange[];
+export interface OcrPage {
+  text: string;
+  // Mean word confidence, 0-100 (Tesseract), or 100 for a vision model.
+  confidence: number;
+  words: OcrWord[];
+  // 'tesseract', or the vision model that transcribed the page.
+  engine: string;
 }
 
-export interface DigestPageEntry {
-  pageNumber: number;
-  headings: string[];
-  sectionTitle: string;
-  keywords: string[];
-  description: string;
-}
-
-export interface DocumentDigest {
-  version: number;
-  documentFingerprint: string;
-  documentName: string;
-  pageCount: number;
-  generatedAt: number;
-  providerId: AIProvider;
-  model: string;
-  overview: string;
-  majorTopics: DigestTopic[];
-  sections: DigestSection[];
-  pages: DigestPageEntry[];
-}
-
-export type DigestStatus =
-  | 'idle'
-  | 'extracting'
-  | 'loading'
-  | 'generating'
-  | 'consolidating'
-  | 'ready'
-  | 'error'
-  | 'cancelled'
-  | 'needs-approval';
+// Text extraction state of a document tab.
+export type IndexStatus = 'idle' | 'extracting' | 'ready';
 
 // ─── Settings ───
 
@@ -181,14 +221,25 @@ export interface AppSettings {
   contextMode: ContextMode;
   maxContextChars: number;
   customInstructions: string;
-  digestEnabled: boolean;
-  // When false, building the page index with a cloud provider waits for the
-  // user to approve sending the document text.
-  digestAutoCloud: boolean;
-  digestProvider: 'active' | AIProvider;
-  digestModels: Record<AIProvider, string>;
-  digestChunkChars: number;
-  maxRetrievedRanges: number;
+  // Meaning-based search with a local embedding model, downloaded on first use.
+  semanticSearch: boolean;
+  // Most open PDFs one chat searches at once (1-50).
+  chatMaxDocuments: number;
+  // Send the user's highlights and notes with questions.
+  includeNotes: boolean;
+  // Give passages the user marked extra weight in retrieval.
+  highlightWeight: boolean;
+  // What each highlight color means to the user; sent with each marking.
+  colorLabels: Record<HighlightColor, string>;
+  // Author written into annotations. Empty means the computer's user name.
+  authorName: string;
+  // Save highlights as drawings in the page instead of annotations (for
+  // printing or sharing with readers that ignore annotations).
+  flattenOnSave: boolean;
+  // Deep mode: the model searches and reads the documents itself with tools.
+  deepMode: boolean;
+  // Recognize text on scanned pages with Tesseract (English) on this computer.
+  ocrEnabled: boolean;
 }
 
 export const DEFAULT_PROVIDERS: Record<AIProvider, ProviderConfig> = {
@@ -244,16 +295,19 @@ export const DEFAULT_SETTINGS: AppSettings = {
   contextMode: 'documentAware',
   maxContextChars: 100000,
   customInstructions: '',
-  digestEnabled: true,
-  digestAutoCloud: false,
-  digestProvider: 'active',
-  digestModels: {
-    ollama: '',
-    claude: '',
-    openai: '',
-    openaiCompatible: '',
-    gemini: '',
+  semanticSearch: true,
+  chatMaxDocuments: 10,
+  includeNotes: true,
+  highlightWeight: true,
+  colorLabels: {
+    yellow: 'important',
+    green: 'use in my work',
+    blue: 'method or definition',
+    pink: 'disagree or question',
+    orange: 'follow up',
   },
-  digestChunkChars: 60000,
-  maxRetrievedRanges: 4,
+  authorName: '',
+  flattenOnSave: false,
+  deepMode: false,
+  ocrEnabled: true,
 };

@@ -8,11 +8,13 @@ import fs from 'fs';
 // Content-Security-Policy for built pages. Scripts, workers and fonts load only
 // from the app itself, so a malicious PDF or model answer cannot pull in code.
 // connect-src must stay open to http(s) because users configure their own AI
-// endpoints (including Ollama on another machine). The development server is
-// left without a CSP because Vite injects inline scripts for hot reload.
+// endpoints (including Ollama on another machine). 'wasm-unsafe-eval' lets the
+// bundled embedding runtime compile its WebAssembly; it does not allow eval or
+// scripts from anywhere else. The development server is left without a CSP
+// because Vite injects inline scripts for hot reload.
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
-  "script-src 'self'",
+  "script-src 'self' 'wasm-unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
   "font-src 'self' data:",
@@ -44,6 +46,24 @@ const pdfjsAssetsAndCsp: Plugin = {
         { recursive: true }
       );
     }
+    // OCR: Tesseract's worker, its WebAssembly cores (LSTM only; the worker
+    // picks relaxed-SIMD, SIMD or plain at run time) and English data.
+    const ocrDir = path.join(outDir, 'ocr');
+    fs.mkdirSync(ocrDir, { recursive: true });
+    fs.copyFileSync(path.resolve(__dirname, 'node_modules/tesseract.js/dist/worker.min.js'), path.join(ocrDir, 'worker.min.js'));
+    for (const core of ['tesseract-core-relaxedsimd-lstm.wasm.js', 'tesseract-core-simd-lstm.wasm.js', 'tesseract-core-lstm.wasm.js']) {
+      fs.copyFileSync(path.resolve(__dirname, 'node_modules/tesseract.js-core', core), path.join(ocrDir, core));
+    }
+    fs.copyFileSync(
+      path.resolve(__dirname, 'node_modules/@tesseract.js-data/eng/4.0.0_best_int/eng.traineddata.gz'),
+      path.join(ocrDir, 'eng.traineddata.gz')
+    );
+    // The embedding runtime loads this file at run time (see embedding-client.ts).
+    fs.mkdirSync(path.join(outDir, 'ort'), { recursive: true });
+    fs.copyFileSync(
+      path.resolve(__dirname, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.wasm'),
+      path.join(outDir, 'ort', 'ort-wasm-simd-threaded.wasm')
+    );
   },
 };
 
@@ -86,6 +106,9 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['pdfjs-dist'],
+    exclude: ['pdfjs-dist', 'onnxruntime-web'],
+  },
+  worker: {
+    format: 'es',
   },
 });

@@ -38,7 +38,7 @@ test('sidebar resizing is clamped and synchronized to settings', () => {
   assert.equal(useStore.getState().sidebarWidth, 1200);
 });
 
-test('opening a document clears the previous document session', () => {
+test('opening a document clears the previous document view but keeps chats', () => {
   useStore.setState({
     conversations: [conversation('old-document')],
     activeConversation: 'old-document',
@@ -47,29 +47,19 @@ test('opening a document clears the previous document session', () => {
     isStreaming: true,
     extractedPageCount: 203,
     documentTextReady: true,
-    documentDigest: {
-      version: 1,
-      documentFingerprint: 'a'.repeat(64),
-      documentName: 'old.pdf',
-      pageCount: 10,
-      generatedAt: 1,
-      providerId: 'ollama',
-      model: 'test',
-      overview: 'old',
-      majorTopics: [],
-      sections: [],
-    },
+    documentOutline: [{ title: 'Old', page: 1, depth: 0 }],
   });
 
   useStore.getState().setPdfFile(pdf('new.pdf'));
   const state = useStore.getState();
-  assert.deepEqual(state.conversations, []);
-  assert.equal(state.activeConversation, null);
+  // Chats belong to the workspace, not to one PDF.
+  assert.equal(state.conversations[0].id, 'old-document');
   assert.equal(state.selectedTextForAI, '');
-  assert.equal(state.isStreaming, false);
+  // An answer in progress keeps streaming; it is not tied to the old tab.
+  assert.equal(state.isStreaming, true);
   assert.equal(state.extractedPageCount, 0);
   assert.equal(state.documentTextReady, false);
-  assert.equal(state.documentDigest, null);
+  assert.deepEqual(state.documentOutline, []);
 });
 
 test('extracted page text is merged in batches without losing earlier pages', () => {
@@ -85,17 +75,6 @@ test('extracted page text is merged in batches without losing earlier pages', ()
   assert.equal(useStore.getState().pageTexts, state.pageTexts);
 });
 
-test('page-index approval is remembered per document tab', () => {
-  useStore.getState().setPdfFile(null);
-  useStore.getState().setPdfFile(pdf('approved.pdf'));
-  const approvedTab = useStore.getState().activeDocumentTabId;
-  useStore.getState().approveDocumentDigest();
-  useStore.getState().setPdfFile(pdf('other.pdf'));
-  assert.equal(useStore.getState().digestApproved, false);
-  useStore.getState().switchDocumentTab(approvedTab);
-  assert.equal(useStore.getState().digestApproved, true);
-});
-
 test('closing a tab releases its parsed PDF document', async () => {
   useStore.getState().setPdfFile(null);
   useStore.getState().setPdfFile(pdf('release.pdf'));
@@ -107,52 +86,36 @@ test('closing a tab releases its parsed PDF document', async () => {
   assert.equal(destroyed, 1);
 });
 
-test('document tabs preserve independent viewer, chat, and page-index state', () => {
+test('document tabs keep their own viewer state while chats are shared', () => {
   useStore.getState().setPdfFile(null);
+  useStore.setState({ conversations: [], activeConversation: null });
   useStore.getState().setPdfFile(pdf('A.pdf'));
   const tabA = useStore.getState().activeDocumentTabId;
   useStore.getState().setCurrentPage(17);
-  const conversationA = useStore.getState().newConversation();
-  useStore.getState().addMessage(conversationA, {
-    id: 'a-message', role: 'user', content: 'Question for A', timestamp: 1,
+  const conversation = useStore.getState().newConversation();
+  useStore.getState().addMessage(conversation, {
+    id: 'a-message', role: 'user', content: 'Question asked while A was open', timestamp: 1,
   });
-  useStore.getState().setDocumentDigest({
-    version: 2,
-    documentFingerprint: 'a'.repeat(64),
-    documentName: 'A.pdf',
-    pageCount: 20,
-    generatedAt: 1,
-    providerId: 'openaiCompatible',
-    model: 'index-model-a',
-    overview: 'A index',
-    majorTopics: [],
-    sections: [],
-    pages: [],
-  });
+  useStore.getState().setDocumentOutline([{ title: 'A outline', page: 1, depth: 0 }]);
 
   useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
   assert.notEqual(tabA, tabB);
   assert.equal(useStore.getState().currentPage, 1);
-  assert.deepEqual(useStore.getState().conversations, []);
-  assert.equal(useStore.getState().documentDigest, null);
+  assert.deepEqual(useStore.getState().documentOutline, []);
+  assert.equal(useStore.getState().conversations[0].messages[0].content, 'Question asked while A was open');
+  assert.deepEqual(useStore.getState().recentTabIds, [tabB, tabA]);
 
   useStore.getState().setCurrentPage(4);
-  const conversationB = useStore.getState().newConversation();
-  useStore.getState().addMessage(conversationB, {
-    id: 'b-message', role: 'user', content: 'Question for B', timestamp: 2,
-  });
-
   useStore.getState().switchDocumentTab(tabA);
   assert.equal(useStore.getState().pdfFile.name, 'A.pdf');
   assert.equal(useStore.getState().currentPage, 17);
-  assert.equal(useStore.getState().conversations[0].messages[0].content, 'Question for A');
-  assert.equal(useStore.getState().documentDigest.model, 'index-model-a');
+  assert.equal(useStore.getState().documentOutline[0].title, 'A outline');
+  assert.deepEqual(useStore.getState().recentTabIds, [tabA, tabB]);
 
   useStore.getState().switchDocumentTab(tabB);
-  assert.equal(useStore.getState().pdfFile.name, 'B.pdf');
   assert.equal(useStore.getState().currentPage, 4);
-  assert.equal(useStore.getState().conversations[0].messages[0].content, 'Question for B');
+  assert.equal(useStore.getState().conversations.length, 1);
 });
 
 test('opening an already-open PDF focuses its existing tab', () => {
@@ -181,26 +144,35 @@ test('closing tabs selects the nearest document and returns to welcome after the
   assert.deepEqual(useStore.getState().documentTabs, []);
 });
 
-test('background chat updates remain attached to their originating document tab', () => {
+test('an answer keeps streaming into its chat when the user switches tabs', () => {
+  useStore.getState().setPdfFile(null);
+  useStore.setState({ conversations: [], activeConversation: null });
+  useStore.getState().setPdfFile(pdf('A.pdf'));
+  const conversation = useStore.getState().newConversation();
+  useStore.getState().addMessage(conversation, {
+    id: 'assistant-a', role: 'assistant', content: '', timestamp: 1, status: 'streaming',
+  });
+  useStore.getState().setIsStreaming(true);
+  useStore.getState().setPdfFile(pdf('B.pdf'));
+
+  useStore.getState().updateLastAssistantMessage(conversation, 'Answer');
+  useStore.getState().patchLastAssistantMessage(conversation, { status: 'done', sources: [{ label: 'D1', key: 'a', page: 2 }] });
+  useStore.getState().setIsStreaming(false);
+  const message = useStore.getState().conversations[0].messages[0];
+  assert.equal(message.content, 'Answer');
+  assert.equal(message.status, 'done');
+  assert.equal(message.sources[0].page, 2);
+  assert.equal(useStore.getState().isStreaming, false);
+});
+
+test('closing a tab removes it from the recently viewed list', () => {
   useStore.getState().setPdfFile(null);
   useStore.getState().setPdfFile(pdf('A.pdf'));
   const tabA = useStore.getState().activeDocumentTabId;
-  const conversationA = useStore.getState().newConversation();
-  useStore.getState().addMessage(conversationA, {
-    id: 'assistant-a', role: 'assistant', content: '', timestamp: 1,
-  }, tabA);
-  useStore.getState().setIsStreaming(true, tabA);
   useStore.getState().setPdfFile(pdf('B.pdf'));
   const tabB = useStore.getState().activeDocumentTabId;
-
-  useStore.getState().updateLastAssistantMessage(conversationA, 'Answer for A', tabA);
-  useStore.getState().setIsStreaming(false, tabA);
-  assert.equal(useStore.getState().activeDocumentTabId, tabB);
-  assert.deepEqual(useStore.getState().conversations, []);
-
-  useStore.getState().switchDocumentTab(tabA);
-  assert.equal(useStore.getState().conversations[0].messages[0].content, 'Answer for A');
-  assert.equal(useStore.getState().isStreaming, false);
+  useStore.getState().closeDocumentTab(tabB);
+  assert.deepEqual(useStore.getState().recentTabIds, [tabA]);
 });
 
 test('annotations can be commented, removed, undone, and redone', () => {
@@ -230,4 +202,25 @@ test('annotations can be commented, removed, undone, and redone', () => {
   assert.equal(useStore.getState().highlights[0].comment, 'Review this statement');
   useStore.getState().redo();
   assert.equal(useStore.getState().highlights.length, 0);
+});
+
+test('background extraction writes to its own tab, not the active one', () => {
+  useStore.getState().setPdfFile(null);
+  useStore.getState().setPdfFile(pdf('first.pdf'));
+  const firstTab = useStore.getState().activeDocumentTabId;
+  useStore.getState().setPdfFile(pdf('second.pdf'));
+  const store = useStore.getState();
+  store.mergePageTexts([[1, 'background text']], firstTab, [[1, ['1 Introduction']]]);
+  store.setExtractionProgress(1, true, firstTab);
+  store.setDocumentOutline([{ title: 'Intro', page: 1, depth: 0 }], firstTab);
+  const state = useStore.getState();
+  assert.equal(state.pageTexts.size, 0);
+  assert.equal(state.documentTextReady, false);
+  const background = state.documentTabs.find((tab) => tab.id === firstTab);
+  assert.equal(background.pageTexts.get(1), 'background text');
+  assert.deepEqual(background.pageHeadings.get(1), ['1 Introduction']);
+  assert.equal(background.documentTextReady, true);
+  assert.equal(background.documentOutline[0].title, 'Intro');
+  useStore.getState().switchDocumentTab(firstTab);
+  assert.equal(useStore.getState().pageTexts.get(1), 'background text');
 });

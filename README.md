@@ -268,6 +268,50 @@ Then register it in `DEFAULT_PROVIDERS` in `src/types.ts`.
 
 Lexio follows [Semantic Versioning](https://semver.org/). While the application remains in active pre-1.0 development, backward-compatible feature milestones increment the minor version and bug fixes increment the patch version. Version `1.0.0` is reserved for the first stable release. The entry matching the version in `package.json` is required; the automated test suite checks this, so every future version change must update this catalog before it can pass verification.
 
+### Unreleased: Workspace AI
+
+Document search:
+- Every open PDF is extracted in the background, active tab first, and its text, headings and outline are cached by file hash. The viewer no longer extracts text itself.
+- A new search index splits pages into passages tagged with page and section. Its tokenizer keeps numbers and acronyms, matches "Table 3", "Figure 2" and "Appendix F" exactly, rejoins words hyphenated across lines, and splits Chinese and Japanese text into two-character pieces.
+- Optional meaning-based search with a small English model (all-MiniLM-L6-v2, 23 MB) that runs on your computer. It is downloaded once on request from Hugging Face and checked against a pinned SHA-256. Passages are scored by their best 2-3 sentence window.
+- Questions send the whole PDF when it fits the model; otherwise a weighted blend of keyword and meaning scores picks passages, best first, within the budget. On the generated evaluation set, the right text reached the model for 94% of questions, up from 56%.
+- Context budgets follow each model's context window. Ollama now receives `num_ctx`, and each provider has a context window setting.
+- The LLM-built page index was removed. Indexing no longer sends documents to an AI provider.
+
+Workspace chat:
+- Chats are no longer tied to one tab. A chat searches the open PDFs chosen with the chips above the input (by default the most recently viewed, up to a Settings limit of 1-50, default 10). Documents get labels (D1, D2, ...) that never change within a chat, and a question can name one with `@D2`.
+- Comparison questions give each document an equal share of the context.
+- Answers cite pages as `[D1 p.3]` and notes as `[D1 N2]`. Citations become chips that open the PDF at that page and outline it. A citation to a page that was not sent to the model is marked as unverified.
+- Memory: follow-up questions ("why?", "what about the second one?") reuse the previous question for search and the pages the previous answer used. Selected passages stay in the history. Failed and stopped answers are not sent back, and the history has its own token budget.
+- Your highlights, underlines, strikethroughs and comments are sent with questions, marked inline (`<mark>`, `<u>`, `<del>`, `<note>`) plus a list of all markings. Highlighted passages get extra weight in retrieval; strikethroughs get none. Each highlight color has an editable meaning in Settings.
+- Chats are saved and restored when the app starts. Markdown tables render in answers.
+
+Annotations that other PDF readers understand:
+- Save PDF now writes standard Highlight, Underline and StrikeOut annotations with the comment, author, dates and an appearance stream, instead of flat drawings. Comments are no longer lost. The author defaults to the computer's user name and can be changed in Settings.
+- Highlights, underlines, strikethroughs, sticky notes, text boxes and replies made in other apps (tested with the structures written by Microsoft Edge, Acrobat Online and Foxit PDF) are read when a PDF opens, with the highlighted words recovered from their positions. They can be commented on or removed, and saving updates or removes exactly those annotations. Drawings and shapes are listed read-only.
+- Saving starts from the original file every time and leaves links, forms and other annotations untouched. Positions account for page rotation and cropping (previously highlights were misplaced on such pages).
+- Encrypted PDFs cannot be written; Lexio says so and keeps the notes. Saving a signed PDF asks first, because it invalidates the signature.
+- Notes are saved automatically per PDF and merged on the next open with any changes other apps made to the file.
+- Optional "flatten" draws new highlights into the page for printing.
+- Known limits: pdf.js does not expose an annotation's /NM name or a grouped annotation's own text, so Lexio cannot tell its own saved annotations from other apps' and does not show Acrobat's "replace text" suggestions. Thumbnails show the file's annotations as saved.
+
+Cross-document analysis:
+- An "Analyze" button asks each selected PDF the question separately (so each gets the full context budget), then combines the answers in one more request. With an empty question it compares the documents' question, method, data, findings and limitations, usually as a table.
+- Each per-document request also returns a paper card (title, authors, question, method, data, findings with pages, limitations, stated future work), cached per PDF and model. Card page references are kept only for pages that request actually saw. Cached cards are added to later comparison questions.
+- Research-gap questions separate limitations and future work the authors state (cited) from topics none of the loaded documents cover, which are labeled as such and never presented as gaps in the whole field.
+- Answers with tables have a "Copy table as CSV" button.
+
+Deep mode (opt-in):
+- With "Deep on", the AI searches and reads the PDFs itself before answering, over up to 8 steps, using read-only tools: list documents, get an outline, search passages, read pages, find exact phrases, get your markings, and get a paper card. Each call and the whole turn have reading limits.
+- Every tool only reads. None writes files, uses the network or changes settings, so instructions hidden in a PDF can at most make the AI read more. The prompt also tells the model that tool results are document text, not instructions.
+- Pages a tool returned count as sent, so citation checks work as usual. The answer lists what the AI looked at.
+- Supported for Claude (tool_use), OpenAI and OpenAI-compatible endpoints (tool_calls), Gemini (function calls) and Ollama (tool_calls). If a model or endpoint rejects tools, the chat answers without deep mode and says so. The request formats follow each API's documentation and are covered by tests with recorded stream formats; they have not been run against the live APIs from this environment.
+
+Scanned PDFs:
+- Pages with almost no text are recognized with Tesseract (English) on your computer, in the background, and cached by file hash. The recognized words become the page's text layer, so they can be selected, highlighted, found with Find, searched and asked about. Text from OCR is labeled as such for the AI.
+- A page can be re-read with the chat's vision model (Claude, OpenAI, Gemini, Ollama or a compatible endpoint) from the document index panel, for tables, equations or poor scans. Cloud providers ask before the page image is sent.
+- Tesseract's worker, WebAssembly cores and English data (about 15 MB) ship with the app and are never loaded from a CDN.
+
 ### Unreleased: Security and performance hardening
 
 Security:

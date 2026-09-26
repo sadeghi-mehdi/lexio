@@ -1,70 +1,86 @@
 import { useEffect, useState } from 'react';
-import { Database, FileText, Plus, RefreshCw, Square, Trash2, X } from 'lucide-react';
+import { Database, Download, FileText, Plus, X } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../stores/useStore';
-import { deleteCachedDigest } from '../utils/document-digest';
+import { rereadPageWithModel, startEmbeddingDownload } from './DocumentIndexer';
+import { isLocalProvider } from '../providers/ai-providers';
+import { needsOcr } from '../utils/ocr';
 
 function statusColor(status: string): string {
   if (status === 'ready') return 'bg-emerald-400';
-  if (status === 'error') return 'bg-red-400';
-  if (status === 'cancelled' || status === 'idle') return 'bg-text-muted';
-  if (status === 'needs-approval') return 'bg-sky-400';
+  if (status === 'idle') return 'bg-text-muted';
   return 'bg-amber-300 animate-pulse';
 }
+
+const MEANING_STATUS: Record<string, string> = {
+  unknown: 'checking…',
+  unavailable: 'needs the desktop app',
+  'not-installed': 'model not downloaded',
+  downloading: 'downloading model',
+  loading: 'loading model',
+  indexing: 'preparing',
+  ready: 'ready',
+  error: 'error',
+};
 
 export default function DocumentTabs() {
   const {
     documentTabs,
     activeDocumentTabId,
-    digestStatus,
-    digestProgress,
-    digestError,
-    documentDigest,
-    documentFingerprint,
+    indexStatus,
+    indexProgress,
     extractedPageCount,
     numPages,
-    isStreaming,
+    documentOutline,
+    currentPage,
+    ocrPages,
+    pageTexts,
+    providerConfig,
+    embeddingStatus,
+    embeddingProgress,
+    semanticSearch,
     switchDocumentTab,
     closeDocumentTab,
-    rebuildDocumentDigest,
-    cancelDocumentDigest,
-    setDocumentDigest,
-    setDigestState,
     setCurrentPage,
   } = useStore(useShallow((state) => ({
     documentTabs: state.documentTabs,
     activeDocumentTabId: state.activeDocumentTabId,
-    digestStatus: state.digestStatus,
-    digestProgress: state.digestProgress,
-    digestError: state.digestError,
-    documentDigest: state.documentDigest,
-    documentFingerprint: state.documentFingerprint,
+    indexStatus: state.indexStatus,
+    indexProgress: state.indexProgress,
     extractedPageCount: state.extractedPageCount,
     numPages: state.numPages,
-    isStreaming: state.isStreaming,
+    documentOutline: state.documentOutline,
+    currentPage: state.currentPage,
+    ocrPages: state.ocrPages,
+    pageTexts: state.pageTexts,
+    providerConfig: state.settings.providers[state.settings.activeProvider],
+    embeddingStatus: state.embeddingStatus,
+    embeddingProgress: state.embeddingProgress,
+    semanticSearch: state.settings.semanticSearch,
     switchDocumentTab: state.switchDocumentTab,
     closeDocumentTab: state.closeDocumentTab,
-    rebuildDocumentDigest: state.rebuildDocumentDigest,
-    cancelDocumentDigest: state.cancelDocumentDigest,
-    setDocumentDigest: state.setDocumentDigest,
-    setDigestState: state.setDigestState,
     setCurrentPage: state.setCurrentPage,
   })));
   const [showIndex, setShowIndex] = useState(false);
+  const [rereading, setRereading] = useState<string | null>(null);
 
   useEffect(() => setShowIndex(false), [activeDocumentTabId]);
 
   if (documentTabs.length === 0) return null;
 
-  const statusText = digestError || digestProgress || digestStatus;
+  const meaning = semanticSearch
+    ? `Meaning search ${embeddingProgress || MEANING_STATUS[embeddingStatus] || embeddingStatus}`
+    : 'Meaning search off';
+  const statusText = indexStatus === 'extracting'
+    ? `Extracting text ${extractedPageCount}/${numPages || '…'}`
+    : indexProgress || 'Text ready';
 
   return (
     <div className="relative z-30 flex h-10 flex-shrink-0 items-stretch border-b border-surface-3 bg-surface-1">
       <div className="flex min-w-0 flex-1 overflow-x-auto px-2 pt-1">
         {documentTabs.map((tab) => {
           const active = tab.id === activeDocumentTabId;
-          const tabStatus = active ? digestStatus : tab.digestStatus;
-          const tabIsStreaming = active ? isStreaming : tab.isStreaming;
+          const tabStatus = active ? indexStatus : tab.indexStatus;
           return (
             <div
               key={tab.id}
@@ -81,9 +97,6 @@ export default function DocumentTabs() {
               >
                 <FileText size={13} className="flex-shrink-0" />
                 <span className="truncate">{tab.pdfFile.name}</span>
-                {tabIsStreaming && (
-                  <span className="h-1.5 w-1.5 flex-shrink-0 animate-pulse rounded-full bg-accent-light" title="AI response in progress" />
-                )}
                 <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${statusColor(tabStatus)}`} />
               </button>
               <button
@@ -113,82 +126,78 @@ export default function DocumentTabs() {
         title={statusText}
       >
         <Database size={13} />
-        <span className={`h-1.5 w-1.5 rounded-full ${statusColor(digestStatus)}`} />
+        <span className={`h-1.5 w-1.5 rounded-full ${statusColor(indexStatus)}`} />
         <span className="hidden max-w-[180px] truncate xl:inline">
-          {digestStatus === 'ready'
-            ? `Index ready · ${documentDigest?.pages.length || numPages} pages`
-            : digestStatus === 'extracting'
-              ? `Extracting ${extractedPageCount}/${numPages || '…'}`
-              : statusText}
+          {indexStatus === 'extracting' ? statusText : `Text ready · ${numPages} page${numPages === 1 ? '' : 's'}`}
         </span>
       </button>
 
       {showIndex && (
         <div className="absolute right-2 top-[calc(100%+6px)] w-[390px] rounded-xl border border-surface-3 bg-surface-1 p-4 shadow-2xl">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <div className="text-sm font-medium text-text-primary">Document page index</div>
-              <div className={`mt-1 text-xs ${digestStatus === 'error' ? 'text-red-300' : 'text-text-muted'}`}>
-                {statusText}
+          <div className="text-sm font-medium text-text-primary">Document index</div>
+          <div className="mt-1 text-xs text-text-muted">{statusText}</div>
+          <div className={`mt-1 text-xs ${embeddingStatus === 'error' ? 'text-red-300' : 'text-text-muted'}`}>{meaning}</div>
+          {semanticSearch && embeddingStatus === 'not-installed' && (
+            <button
+              onClick={startEmbeddingDownload}
+              className="mt-2 flex items-center gap-1.5 rounded-md border border-accent/30 px-2 py-1 text-xs text-accent-light hover:bg-accent/10"
+            >
+              <Download size={12} /> Download the 23 MB search model
+            </button>
+          )}
+          {(ocrPages.has(currentPage) || (indexStatus === 'ready' && needsOcr(pageTexts.get(currentPage)))) && (
+            <div className="mt-3 rounded-lg border border-surface-3 bg-surface-2 px-2.5 py-2 text-xs text-text-secondary">
+              <div>
+                Page {currentPage}:{' '}
+                {ocrPages.get(currentPage)
+                  ? ocrPages.get(currentPage)!.engine === 'tesseract'
+                    ? `text recognized by OCR (${Math.round(ocrPages.get(currentPage)!.confidence)}% confidence)`
+                    : `text read by ${ocrPages.get(currentPage)!.engine}`
+                  : 'scanned, waiting for OCR'}
               </div>
-            </div>
-            <div className="flex gap-1">
-              {digestStatus === 'needs-approval' && (
-                <button
-                  onClick={() => useStore.getState().approveDocumentDigest()}
-                  className="rounded-md px-2 py-1 text-xs text-accent-light hover:bg-surface-3"
-                  title="Send this document to the AI provider and build its page index"
-                >
-                  Build
-                </button>
-              )}
-              {(digestStatus === 'generating' || digestStatus === 'consolidating') && (
-                <button onClick={cancelDocumentDigest} className="rounded-md p-1.5 text-text-secondary hover:bg-surface-3" title="Cancel indexing">
-                  <Square size={14} />
-                </button>
-              )}
-              <button onClick={rebuildDocumentDigest} className="rounded-md p-1.5 text-text-secondary hover:bg-surface-3" title="Rebuild page index">
-                <RefreshCw size={14} />
-              </button>
               <button
+                disabled={Boolean(rereading) || !activeDocumentTabId}
                 onClick={async () => {
-                  if (documentFingerprint) await deleteCachedDigest(documentFingerprint);
-                  setDocumentDigest(null);
-                  setDigestState('idle', 'Cached page index deleted');
+                  if (!activeDocumentTabId) return;
+                  if (!isLocalProvider(providerConfig) && !window.confirm(
+                    `Send an image of page ${currentPage} to ${providerConfig.name} (${providerConfig.model}) to read its text?`
+                  )) return;
+                  setRereading(`Reading page ${currentPage}…`);
+                  try {
+                    await rereadPageWithModel(activeDocumentTabId, currentPage, new AbortController().signal);
+                    setRereading(null);
+                  } catch (error) {
+                    setRereading(error instanceof Error ? error.message : String(error));
+                    window.setTimeout(() => setRereading(null), 6000);
+                  }
                 }}
-                className="rounded-md p-1.5 text-text-secondary hover:bg-red-500/10 hover:text-red-300"
-                title="Delete cached page index"
+                className="mt-1.5 rounded-md border border-accent/30 px-2 py-1 text-[11px] text-accent-light hover:bg-accent/10 disabled:opacity-50"
+                title="For tables, equations or poor scans. Needs a model that accepts images."
               >
-                <Trash2 size={14} />
+                Re-read page {currentPage} with {providerConfig.model}
               </button>
+              {rereading && <div className="mt-1 text-[11px] text-text-muted">{rereading}</div>}
             </div>
-          </div>
-
-          {documentDigest && (
-            <>
-              <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-text-muted">
-                <div className="rounded-lg bg-surface-2 px-2.5 py-2">Pages indexed<br /><span className="text-text-primary">{documentDigest.pages.length}</span></div>
-                <div className="rounded-lg bg-surface-2 px-2.5 py-2">Index model<br /><span className="break-all text-text-primary">{documentDigest.model}</span></div>
-              </div>
-              <p className="mt-3 max-h-20 overflow-y-auto text-xs leading-relaxed text-text-secondary">
-                {documentDigest.overview}
-              </p>
-              <div className="mt-3 max-h-52 space-y-1.5 overflow-y-auto">
-                {documentDigest.sections.map((section) => (
-                  <button
-                    key={section.id}
-                    onClick={() => {
-                      setCurrentPage(section.startPage);
-                      setShowIndex(false);
-                    }}
-                    className="w-full rounded-lg border border-surface-3 px-2.5 py-2 text-left hover:bg-surface-2"
-                  >
-                    <div className="truncate text-xs text-text-primary">{section.title}</div>
-                    <div className="text-[10px] text-text-muted">Pages {section.startPage}{section.endPage !== section.startPage ? `–${section.endPage}` : ''}</div>
-                  </button>
-                ))}
-              </div>
-            </>
+          )}
+          {documentOutline.length > 0 ? (
+            <div className="mt-3 max-h-64 space-y-0.5 overflow-y-auto">
+              {documentOutline.map((entry, position) => (
+                <button
+                  key={`${entry.page}-${position}`}
+                  onClick={() => {
+                    setCurrentPage(entry.page);
+                    setShowIndex(false);
+                  }}
+                  style={{ paddingLeft: `${0.625 + entry.depth * 0.75}rem` }}
+                  className="flex w-full items-baseline justify-between gap-3 rounded-md py-1 pr-2 text-left hover:bg-surface-2"
+                >
+                  <span className="truncate text-xs text-text-primary">{entry.title}</span>
+                  <span className="flex-shrink-0 text-[10px] text-text-muted">p.{entry.page}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 text-xs text-text-muted">This PDF has no outline.</div>
           )}
         </div>
       )}

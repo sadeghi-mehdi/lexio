@@ -21,9 +21,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings: object) => ipcRenderer.invoke('settings:save', settings),
   credentialStatus: () => ipcRenderer.invoke('settings:credential-status'),
-  loadDigest: (fingerprint: string) => ipcRenderer.invoke('digest:load', fingerprint),
-  saveDigest: (fingerprint: string, digest: object) => ipcRenderer.invoke('digest:save', fingerprint, digest),
-  deleteDigest: (fingerprint: string) => ipcRenderer.invoke('digest:delete', fingerprint),
+  loadLibrary: (kind: string, key: string) => ipcRenderer.invoke('library:load', kind, key),
+  saveLibrary: (kind: string, key: string, data: unknown) => ipcRenderer.invoke('library:save', kind, key, data),
+  deleteLibrary: (kind: string, key: string) => ipcRenderer.invoke('library:delete', kind, key),
+  userName: () => ipcRenderer.invoke('app:user-name'),
+  embeddingStatus: () => ipcRenderer.invoke('embedding:status'),
+  downloadEmbeddingModel: () => ipcRenderer.invoke('embedding:download'),
+  loadEmbeddingModel: () => ipcRenderer.invoke('embedding:load'),
+  onEmbeddingProgress: subscribe('embedding:progress'),
 
   // Menu events from main process
   onPdfOpened: subscribe('pdf:opened'),

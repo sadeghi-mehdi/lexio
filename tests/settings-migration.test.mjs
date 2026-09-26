@@ -34,10 +34,7 @@ test('adds new defaults to older settings without discarding unrelated provider 
   });
   assert.equal(settings.maxContextChars, 700000);
   assert.equal(settings.contextMode, 'documentAware');
-  assert.equal(settings.digestEnabled, true);
-  assert.equal(settings.digestProvider, 'active');
-  assert.equal(settings.digestModels.ollama, '');
-  assert.equal(settings.digestChunkChars, 60000);
+  assert.equal(settings.semanticSearch, true);
   assert.equal(settings.customInstructions, 'Use concise technical language.');
   assert.equal(settings.providers.ollama.model, 'qwen2.5');
   assert.ok(settings.providers.openaiCompatible);
@@ -70,25 +67,18 @@ test('keeps gemma4-e2b-it only on the generic OpenAI-compatible provider', () =>
   assert.deepEqual(settings.providers.openaiCompatible.models, ['gemma4-e2b-it']);
 });
 
-test('page-index models are provider-specific and reject a generic-only legacy override', () => {
-  const settings = normalizeSettings({
-    activeProvider: 'openai',
-    digestProvider: 'active',
-    digestModel: 'gemma4-e2b-it',
-    digestModels: {
-      claude: 'claude-haiku-4-20250414',
-      openaiCompatible: 'gemma4-e2b-it',
-    },
-  });
-
-  assert.equal(settings.digestModels.openai, '');
-  assert.equal(settings.digestModels.claude, 'claude-haiku-4-20250414');
-  assert.equal(settings.digestModels.openaiCompatible, 'gemma4-e2b-it');
+test('the generic endpoint has no default host and old page-index settings are dropped', () => {
+  const settings = normalizeSettings({ digestAutoCloud: true, digestModels: { claude: 'x' } });
+  assert.equal(settings.providers.openaiCompatible.baseUrl, '');
+  assert.equal('digestAutoCloud' in settings, false);
+  assert.equal('digestModels' in settings, false);
 });
 
-test('cloud page indexing asks first and the generic endpoint has no default host', () => {
-  const settings = normalizeSettings({});
-  assert.equal(settings.digestAutoCloud, false);
-  assert.equal(settings.providers.openaiCompatible.baseUrl, '');
-  assert.equal(normalizeSettings({ digestAutoCloud: true }).digestAutoCloud, true);
+test('provider context window overrides are kept and clamped', () => {
+  const settings = normalizeSettings({
+    providers: { ollama: { contextTokens: 32768 }, claude: { contextTokens: -5 }, gemini: { contextTokens: 'x' } },
+  });
+  assert.equal(settings.providers.ollama.contextTokens, 32768);
+  assert.equal(settings.providers.claude.contextTokens, 0);
+  assert.equal(settings.providers.gemini.contextTokens, 0);
 });

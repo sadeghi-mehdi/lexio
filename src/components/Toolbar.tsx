@@ -72,10 +72,10 @@ export default function Toolbar() {
   })));
 
   const handleSave = async () => {
-    const { pdfFile, highlights } = useStore.getState();
+    const { pdfFile, highlights, settings } = useStore.getState();
     if (!pdfFile) return;
     try {
-      await savePdfCopy(pdfFile, highlights);
+      await savePdfCopy(pdfFile, highlights, settings);
     } catch (err) {
       console.error('Failed to save PDF:', err);
     }

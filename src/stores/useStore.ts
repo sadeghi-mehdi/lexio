@@ -10,14 +10,25 @@ import type {
   HighlightColor,
   AnnotationType,
   RelativeRect,
-  DocumentDigest,
-  DigestStatus,
+  IndexStatus,
+  OcrPage,
 } from '../types.ts';
 import { DEFAULT_SETTINGS } from '../types.ts';
 import { abortChatRequest } from '../utils/chat-request-registry.ts';
 import { releaseRegisteredDocument } from '../utils/pdf-document-registry.ts';
+import type { OutlineEntry } from '../utils/text-index.ts';
 
 export type ToolType = 'select' | AnnotationType | 'comment';
+
+export type EmbeddingStatus =
+  | 'unknown'
+  | 'unavailable'
+  | 'not-installed'
+  | 'downloading'
+  | 'loading'
+  | 'indexing'
+  | 'ready'
+  | 'error';
 
 // Undo/Redo action types
 type UndoAction =
@@ -30,6 +41,9 @@ export interface DocumentTabSession {
   identity: string;
   pdfFile: PdfFileData;
   pageTexts: Map<number, string>;
+  pageHeadings: Map<number, string[]>;
+  documentOutline: OutlineEntry[];
+  ocrPages: Map<number, OcrPage>;
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -41,31 +55,28 @@ export interface DocumentTabSession {
   activeTool: ToolType;
   undoStack: UndoAction[];
   redoStack: UndoAction[];
-  conversations: ChatConversation[];
-  activeConversation: string | null;
-  isStreaming: boolean;
   selectedTextForAI: string;
   selectedPageForAI: number;
   selectedEndPageForAI: number;
   selectedRectsForAI: RelativeRect[];
-  documentFingerprint: string;
-  documentDigest: DocumentDigest | null;
-  digestStatus: DigestStatus;
-  digestProgress: string;
-  digestError: string;
-  digestRebuildToken: number;
-  digestCancelToken: number;
-  digestApproved: boolean;
+  indexStatus: IndexStatus;
+  indexProgress: string;
 }
 
 interface AppState {
   documentTabs: DocumentTabSession[];
   activeDocumentTabId: string | null;
+  // Open tab ids, most recently viewed first. A chat searches the first
+  // chatMaxDocuments of them.
+  recentTabIds: string[];
 
   // PDF
   pdfFile: PdfFileData | null;
   documentSessionId: number;
   pageTexts: Map<number, string>;
+  pageHeadings: Map<number, string[]>;
+  documentOutline: OutlineEntry[];
+  ocrPages: Map<number, OcrPage>;
   extractedPageCount: number;
   documentTextReady: boolean;
   numPages: number;
@@ -90,14 +101,15 @@ interface AppState {
   selectedPageForAI: number;
   selectedEndPageForAI: number;
   selectedRectsForAI: RelativeRect[];
-  documentFingerprint: string;
-  documentDigest: DocumentDigest | null;
-  digestStatus: DigestStatus;
-  digestProgress: string;
-  digestError: string;
-  digestRebuildToken: number;
-  digestCancelToken: number;
-  digestApproved: boolean;
+  indexStatus: IndexStatus;
+  indexProgress: string;
+
+  // A page to outline briefly after a citation jump (token restarts the effect).
+  flashPage: { page: number; token: number } | null;
+
+  // Meaning-based search (embedding model and document vectors)
+  embeddingStatus: EmbeddingStatus;
+  embeddingProgress: string;
 
   // UI
   sidebarOpen: boolean;
@@ -113,14 +125,25 @@ interface AppState {
   setPdfFile: (file: PdfFileData | null) => void;
   switchDocumentTab: (id: string) => void;
   closeDocumentTab: (id: string) => void;
-  mergePageTexts: (entries: ReadonlyArray<readonly [number, string]>) => void;
-  setExtractionProgress: (pageCount: number, complete?: boolean) => void;
-  setDocumentFingerprint: (fingerprint: string) => void;
-  setDocumentDigest: (digest: DocumentDigest | null) => void;
-  setDigestState: (status: DigestStatus, progress?: string, error?: string) => void;
-  rebuildDocumentDigest: () => void;
-  cancelDocumentDigest: () => void;
-  approveDocumentDigest: () => void;
+  // Text extraction runs for every open tab in the background, so these take
+  // the target tab. Without one they update the active tab.
+  mergePageTexts: (
+    entries: ReadonlyArray<readonly [number, string]>,
+    tabId?: string | null,
+    headings?: ReadonlyArray<readonly [number, string[]]>
+  ) => void;
+  setExtractionProgress: (pageCount: number, complete?: boolean, tabId?: string | null) => void;
+  setDocumentOutline: (outline: OutlineEntry[], tabId?: string | null) => void;
+  // Replaces a tab's annotation list (annotations read from the file merged
+  // with saved notes). Not an undoable edit.
+  setTabHighlights: (highlights: Highlight[], tabId?: string | null) => void;
+  // Stores recognized text for scanned pages; the text replaces the page's
+  // (nearly empty) extracted text so search, Find and the AI can use it.
+  applyOcrPages: (pages: ReadonlyArray<readonly [number, OcrPage]>, tabId?: string | null) => void;
+  setIndexProgress: (progress: string, tabId?: string | null) => void;
+  setEmbeddingState: (status: EmbeddingStatus, progress?: string) => void;
+  // Opens a document tab at a page and outlines the page briefly.
+  jumpToPage: (tabId: string, page: number) => void;
   setNumPages: (n: number) => void;
   setCurrentPage: (p: number) => void;
   setZoom: (z: number) => void;
@@ -147,10 +170,14 @@ interface AppState {
   setSelectedTextForAI: (text: string, page: number, rects?: RelativeRect[], endPage?: number) => void;
   clearSelectedTextForAI: () => void;
   newConversation: () => string;
-  addMessage: (convId: string, msg: ChatMessage, documentTabId?: string | null) => void;
-  updateLastAssistantMessage: (convId: string, content: string, documentTabId?: string | null) => void;
+  addMessage: (convId: string, msg: ChatMessage) => void;
+  updateLastAssistantMessage: (convId: string, content: string) => void;
+  // Merges fields into the newest assistant message (status, sources, ...).
+  patchLastAssistantMessage: (convId: string, patch: Partial<ChatMessage>) => void;
+  updateConversation: (convId: string, patch: Partial<ChatConversation>) => void;
+  setConversations: (conversations: ChatConversation[]) => void;
   setActiveConversation: (id: string | null) => void;
-  setIsStreaming: (v: boolean, documentTabId?: string | null) => void;
+  setIsStreaming: (v: boolean) => void;
   deleteConversation: (id: string) => void;
 
   // UI Actions
@@ -177,12 +204,14 @@ function documentIdentity(file: PdfFileData): string {
 
 function captureActiveSession(state: AppState): DocumentTabSession | null {
   if (!state.pdfFile || !state.activeDocumentTabId) return null;
-  const indexWasRunning = ['extracting', 'loading', 'generating', 'consolidating'].includes(state.digestStatus);
   return {
     id: state.activeDocumentTabId,
     identity: documentIdentity(state.pdfFile),
     pdfFile: state.pdfFile,
     pageTexts: state.pageTexts,
+    pageHeadings: state.pageHeadings,
+    documentOutline: state.documentOutline,
+    ocrPages: state.ocrPages,
     extractedPageCount: state.extractedPageCount,
     documentTextReady: state.documentTextReady,
     numPages: state.numPages,
@@ -194,21 +223,12 @@ function captureActiveSession(state: AppState): DocumentTabSession | null {
     activeTool: state.activeTool,
     undoStack: state.undoStack,
     redoStack: state.redoStack,
-    conversations: state.conversations,
-    activeConversation: state.activeConversation,
-    isStreaming: state.isStreaming,
     selectedTextForAI: state.selectedTextForAI,
     selectedPageForAI: state.selectedPageForAI,
     selectedEndPageForAI: state.selectedEndPageForAI,
     selectedRectsForAI: state.selectedRectsForAI,
-    documentFingerprint: state.documentFingerprint,
-    documentDigest: state.documentDigest,
-    digestStatus: indexWasRunning ? 'idle' : state.digestStatus,
-    digestProgress: indexWasRunning ? 'Paused — activate this tab to continue' : state.digestProgress,
-    digestError: state.digestError,
-    digestRebuildToken: state.digestRebuildToken,
-    digestCancelToken: state.digestCancelToken,
-    digestApproved: state.digestApproved,
+    indexStatus: state.indexStatus,
+    indexProgress: state.indexProgress,
   };
 }
 
@@ -218,6 +238,9 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     identity: documentIdentity(file),
     pdfFile: file,
     pageTexts: new Map(),
+    pageHeadings: new Map(),
+    documentOutline: [],
+    ocrPages: new Map(),
     extractedPageCount: 0,
     documentTextReady: false,
     numPages: 0,
@@ -229,21 +252,12 @@ function newDocumentSession(file: PdfFileData): DocumentTabSession {
     activeTool: 'select',
     undoStack: [],
     redoStack: [],
-    conversations: [],
-    activeConversation: null,
-    isStreaming: false,
     selectedTextForAI: '',
     selectedPageForAI: 0,
     selectedEndPageForAI: 0,
     selectedRectsForAI: [],
-    documentFingerprint: '',
-    documentDigest: null,
-    digestStatus: 'extracting',
-    digestProgress: 'Extracting PDF text…',
-    digestError: '',
-    digestRebuildToken: 0,
-    digestCancelToken: 0,
-    digestApproved: false,
+    indexStatus: 'extracting',
+    indexProgress: 'Extracting PDF text…',
   };
 }
 
@@ -253,6 +267,9 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     pdfFile: session.pdfFile,
     documentSessionId: nextSessionId,
     pageTexts: session.pageTexts,
+    pageHeadings: session.pageHeadings,
+    documentOutline: session.documentOutline,
+    ocrPages: session.ocrPages,
     extractedPageCount: session.extractedPageCount,
     documentTextReady: session.documentTextReady,
     numPages: session.numPages,
@@ -264,22 +281,39 @@ function activateSession(session: DocumentTabSession, nextSessionId: number): Pa
     activeTool: session.activeTool,
     undoStack: session.undoStack,
     redoStack: session.redoStack,
-    conversations: session.conversations,
-    activeConversation: session.activeConversation,
-    isStreaming: session.isStreaming,
     selectedTextForAI: session.selectedTextForAI,
     selectedPageForAI: session.selectedPageForAI,
     selectedEndPageForAI: session.selectedEndPageForAI,
     selectedRectsForAI: session.selectedRectsForAI,
-    documentFingerprint: session.documentFingerprint,
-    documentDigest: session.documentDigest,
-    digestStatus: session.digestStatus,
-    digestProgress: session.digestProgress,
-    digestError: session.digestError,
-    digestRebuildToken: session.digestRebuildToken,
-    digestCancelToken: session.digestCancelToken,
-    digestApproved: session.digestApproved,
+    indexStatus: session.indexStatus,
+    indexProgress: session.indexProgress,
   };
+}
+
+type TabFields = Omit<DocumentTabSession, 'id' | 'identity' | 'pdfFile'>;
+
+// Chat requests are no longer tied to a tab.
+export const WORKSPACE_CHAT = 'workspace';
+
+function markViewed(recent: readonly string[], id: string): string[] {
+  return [id, ...recent.filter((tabId) => tabId !== id)];
+}
+
+// Applies a change to one document tab. The active tab's fields live at the
+// top level of the state, other tabs' fields in documentTabs.
+function patchTab(
+  state: AppState,
+  tabId: string | null | undefined,
+  change: (tab: TabFields) => Partial<TabFields>
+): Partial<AppState> {
+  if (!tabId || tabId === state.activeDocumentTabId) {
+    return change(state as unknown as TabFields) as Partial<AppState>;
+  }
+  const index = state.documentTabs.findIndex((tab) => tab.id === tabId);
+  if (index < 0) return {};
+  const documentTabs = [...state.documentTabs];
+  documentTabs[index] = { ...documentTabs[index], ...change(documentTabs[index]) };
+  return { documentTabs };
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -287,10 +321,14 @@ export const useStore = create<AppState>((set, get) => ({
 
   documentTabs: [],
   activeDocumentTabId: null,
+  recentTabIds: [],
 
   pdfFile: null,
   documentSessionId: 0,
   pageTexts: new Map(),
+  pageHeadings: new Map(),
+  documentOutline: [],
+  ocrPages: new Map(),
   extractedPageCount: 0,
   documentTextReady: false,
   numPages: 0,
@@ -311,14 +349,12 @@ export const useStore = create<AppState>((set, get) => ({
   selectedPageForAI: 0,
   selectedEndPageForAI: 0,
   selectedRectsForAI: [],
-  documentFingerprint: '',
-  documentDigest: null,
-  digestStatus: 'idle',
-  digestProgress: '',
-  digestError: '',
-  digestRebuildToken: 0,
-  digestCancelToken: 0,
-  digestApproved: false,
+  indexStatus: 'idle',
+  indexProgress: '',
+
+  flashPage: null,
+  embeddingStatus: 'unknown',
+  embeddingProgress: '',
 
   sidebarOpen: true,
   sidebarWidth: 700,
@@ -340,10 +376,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   setPdfFile: (file) => {
     if (!file) {
-      get().documentTabs.forEach((tab) => {
-        abortChatRequest(tab.id);
-        releaseRegisteredDocument(tab.id);
-      });
+      abortChatRequest(WORKSPACE_CHAT);
+      get().documentTabs.forEach((tab) => releaseRegisteredDocument(tab.id));
     }
     set((state) => {
     const captured = captureActiveSession(state);
@@ -354,9 +388,14 @@ export const useStore = create<AppState>((set, get) => ({
       return {
         documentTabs: [],
         activeDocumentTabId: null,
+        recentTabIds: [],
+        isStreaming: false,
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
+        pageHeadings: new Map(),
+        documentOutline: [],
+        ocrPages: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -366,19 +405,12 @@ export const useStore = create<AppState>((set, get) => ({
         annotations: [],
         undoStack: [],
         redoStack: [],
-        conversations: [],
-        activeConversation: null,
-        isStreaming: false,
         selectedTextForAI: '',
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
         selectedRectsForAI: [],
-        documentFingerprint: '',
-        documentDigest: null,
-        digestStatus: 'idle',
-        digestProgress: '',
-        digestError: '',
-        digestApproved: false,
+        indexStatus: 'idle',
+        indexProgress: '',
       };
     }
     const identity = documentIdentity(file);
@@ -386,6 +418,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (existing) {
       return {
         documentTabs,
+        recentTabIds: markViewed(state.recentTabIds, existing.id),
         ...activateSession(existing, state.documentSessionId + 1),
       };
     }
@@ -393,6 +426,7 @@ export const useStore = create<AppState>((set, get) => ({
     documentTabs = [...documentTabs, session];
     return {
       documentTabs,
+      recentTabIds: markViewed(state.recentTabIds, session.id),
       ...activateSession(session, state.documentSessionId + 1),
     };
     });
@@ -407,11 +441,11 @@ export const useStore = create<AppState>((set, get) => ({
     if (!target) return state;
     return {
       documentTabs,
+      recentTabIds: markViewed(state.recentTabIds, id),
       ...activateSession(target, state.documentSessionId + 1),
     };
   }),
   closeDocumentTab: (id) => {
-    abortChatRequest(id);
     releaseRegisteredDocument(id);
     set((state) => {
       const captured = captureActiveSession(state);
@@ -421,20 +455,26 @@ export const useStore = create<AppState>((set, get) => ({
       const closingIndex = synchronizedTabs.findIndex((tab) => tab.id === id);
       if (closingIndex < 0) return state;
       const documentTabs = synchronizedTabs.filter((tab) => tab.id !== id);
-      if (id !== state.activeDocumentTabId) return { documentTabs };
+      const recentTabIds = state.recentTabIds.filter((tabId) => tabId !== id);
+      if (id !== state.activeDocumentTabId) return { documentTabs, recentTabIds };
       const nextTab = documentTabs[Math.min(closingIndex, documentTabs.length - 1)];
       if (nextTab) {
         return {
           documentTabs,
+          recentTabIds: markViewed(recentTabIds, nextTab.id),
           ...activateSession(nextTab, state.documentSessionId + 1),
         };
       }
       return {
         documentTabs: [],
         activeDocumentTabId: null,
+        recentTabIds: [],
         pdfFile: null,
         documentSessionId: state.documentSessionId + 1,
         pageTexts: new Map(),
+        pageHeadings: new Map(),
+        documentOutline: [],
+        ocrPages: new Map(),
         extractedPageCount: 0,
         documentTextReady: false,
         numPages: 0,
@@ -443,59 +483,56 @@ export const useStore = create<AppState>((set, get) => ({
         annotations: [],
         undoStack: [],
         redoStack: [],
-        conversations: [],
-        activeConversation: null,
-        isStreaming: false,
         selectedTextForAI: '',
         selectedPageForAI: 0,
         selectedEndPageForAI: 0,
         selectedRectsForAI: [],
-        documentFingerprint: '',
-        documentDigest: null,
-        digestStatus: 'idle',
-        digestProgress: '',
-        digestError: '',
-        digestApproved: false,
+        indexStatus: 'idle',
+        indexProgress: '',
       };
     });
   },
   // Extraction commits pages in batches. Copying the Map once per batch
   // instead of once per page keeps extraction linear in the page count.
-  mergePageTexts: (entries) =>
-    set((s) => {
-      if (entries.length === 0) return s;
-      const newMap = new Map(s.pageTexts);
-      for (const [page, text] of entries) newMap.set(page, text);
-      return { pageTexts: newMap };
-    }),
-  setExtractionProgress: (extractedPageCount, documentTextReady = false) => set({
-    extractedPageCount,
-    documentTextReady,
-    digestStatus: documentTextReady ? 'idle' : 'extracting',
-    digestProgress: documentTextReady
-      ? 'PDF text extraction complete'
-      : `Extracting PDF text — page ${extractedPageCount}`,
-  }),
-  setDocumentFingerprint: (documentFingerprint) => set({ documentFingerprint }),
-  setDocumentDigest: (documentDigest) => set({ documentDigest }),
-  setDigestState: (digestStatus, digestProgress = '', digestError = '') => set({
-    digestStatus,
-    digestProgress,
-    digestError,
-  }),
-  rebuildDocumentDigest: () => set((state) => ({
-    documentDigest: null,
-    digestError: '',
-    digestStatus: state.documentTextReady ? 'loading' : 'extracting',
-    digestProgress: 'Rebuilding document digest…',
-    digestRebuildToken: state.digestRebuildToken + 1,
-  })),
-  approveDocumentDigest: () => set({ digestApproved: true }),
-  cancelDocumentDigest: () => set((state) => ({
-    digestStatus: 'cancelled',
-    digestProgress: 'Document digest generation cancelled',
-    digestCancelToken: state.digestCancelToken + 1,
-  })),
+  mergePageTexts: (entries, tabId, headings = []) =>
+    set((s) => patchTab(s, tabId, (tab) => {
+      if (entries.length === 0 && headings.length === 0) return {};
+      const pageTexts = new Map(tab.pageTexts);
+      for (const [page, text] of entries) pageTexts.set(page, text);
+      const pageHeadings = headings.length ? new Map(tab.pageHeadings) : tab.pageHeadings;
+      for (const [page, lines] of headings) pageHeadings.set(page, lines);
+      return { pageTexts, pageHeadings };
+    })),
+  setExtractionProgress: (extractedPageCount, documentTextReady = false, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({
+      extractedPageCount,
+      documentTextReady,
+      indexStatus: documentTextReady ? 'ready' : 'extracting',
+      indexProgress: documentTextReady
+        ? 'PDF text extraction complete'
+        : `Extracting PDF text — page ${extractedPageCount}`,
+    }))),
+  setDocumentOutline: (documentOutline, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({ documentOutline }))),
+  setTabHighlights: (highlights, tabId) =>
+    set((s) => patchTab(s, tabId, () => ({ highlights }))),
+  setIndexProgress: (indexProgress, tabId) => set((s) => patchTab(s, tabId, () => ({ indexProgress }))),
+  applyOcrPages: (pages, tabId) =>
+    set((s) => patchTab(s, tabId, (tab) => {
+      if (pages.length === 0) return {};
+      const pageTexts = new Map(tab.pageTexts);
+      const ocrPages = new Map(tab.ocrPages);
+      for (const [page, ocr] of pages) {
+        pageTexts.set(page, ocr.text);
+        ocrPages.set(page, ocr);
+      }
+      return { pageTexts, ocrPages };
+    })),
+  setEmbeddingState: (embeddingStatus, embeddingProgress = '') => set({ embeddingStatus, embeddingProgress }),
+  jumpToPage: (tabId, page) => {
+    if (get().activeDocumentTabId !== tabId) get().switchDocumentTab(tabId);
+    set((s) => ({ currentPage: page, flashPage: { page, token: (s.flashPage?.token || 0) + 1 } }));
+  },
   setNumPages: (n) => set({ numPages: n }),
   setCurrentPage: (p) => set({ currentPage: p }),
   setZoom: (z) => set({ zoom: Math.max(0.25, Math.min(5, z)) }),
@@ -624,11 +661,15 @@ export const useStore = create<AppState>((set, get) => ({
   }),
   newConversation: () => {
     const id = uid();
+    const now = Date.now();
     const conv: ChatConversation = {
       id,
       title: 'New Chat',
       messages: [],
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
+      documents: [],
+      scope: { mode: 'all', keys: [] },
     };
     set((s) => ({
       conversations: [...s.conversations, conv],
@@ -636,63 +677,50 @@ export const useStore = create<AppState>((set, get) => ({
     }));
     return id;
   },
-  addMessage: (convId, msg, documentTabId) =>
-    set((s) => {
-      const targetTabId = documentTabId || s.activeDocumentTabId;
-      const addTo = (conversations: ChatConversation[]) => conversations.map((c) =>
+  addMessage: (convId, msg) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) =>
         c.id === convId
           ? {
               ...c,
               messages: [...c.messages, msg],
+              updatedAt: Date.now(),
               title:
                 c.messages.length === 0 && msg.role === 'user'
                   ? msg.content.slice(0, 60) + (msg.content.length > 60 ? '…' : '')
                   : c.title,
             }
           : c
-      );
-      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
-        return { conversations: addTo(s.conversations) };
-      }
-      return {
-        documentTabs: s.documentTabs.map((tab) =>
-          tab.id === targetTabId ? { ...tab, conversations: addTo(tab.conversations) } : tab
-        ),
-      };
-    }),
-  updateLastAssistantMessage: (convId, content, documentTabId) =>
-    set((s) => {
-      const targetTabId = documentTabId || s.activeDocumentTabId;
-      const update = (conversations: ChatConversation[]) => conversations.map((c) => {
+      ),
+    })),
+  updateLastAssistantMessage: (convId, content) => get().patchLastAssistantMessage(convId, { content }),
+  patchLastAssistantMessage: (convId, patch) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) => {
         if (c.id !== convId) return c;
         const msgs = [...c.messages];
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i].role === 'assistant') {
-            msgs[i] = { ...msgs[i], content };
+            msgs[i] = { ...msgs[i], ...patch };
             break;
           }
         }
         return { ...c, messages: msgs };
-      });
-      if (!targetTabId || targetTabId === s.activeDocumentTabId) {
-        return { conversations: update(s.conversations) };
-      }
-      return {
-        documentTabs: s.documentTabs.map((tab) =>
-          tab.id === targetTabId ? { ...tab, conversations: update(tab.conversations) } : tab
-        ),
-      };
-    }),
+      }),
+    })),
+  updateConversation: (convId, patch) =>
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === convId ? { ...c, ...patch } : c)),
+    })),
+  setConversations: (conversations) =>
+    set((s) => ({
+      conversations,
+      activeConversation: conversations.some((c) => c.id === s.activeConversation)
+        ? s.activeConversation
+        : conversations[conversations.length - 1]?.id || null,
+    })),
   setActiveConversation: (id) => set({ activeConversation: id }),
-  setIsStreaming: (v, documentTabId) => set((s) => {
-    const targetTabId = documentTabId || s.activeDocumentTabId;
-    if (!targetTabId || targetTabId === s.activeDocumentTabId) return { isStreaming: v };
-    return {
-      documentTabs: s.documentTabs.map((tab) =>
-        tab.id === targetTabId ? { ...tab, isStreaming: v } : tab
-      ),
-    };
-  }),
+  setIsStreaming: (v) => set({ isStreaming: v }),
   deleteConversation: (id) =>
     set((s) => {
       const removedIndex = s.conversations.findIndex((conversation) => conversation.id === id);
